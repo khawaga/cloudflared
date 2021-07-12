@@ -12,15 +12,18 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 
+	"github.com/cloudflare/cloudflared/carrier"
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/ingress"
 	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
+	"github.com/cloudflare/cloudflared/websocket"
 )
 
 const (
-	TagHeaderNamePrefix = "Cf-Warp-Tag-"
-	LogFieldCFRay       = "cfRay"
-	LogFieldRule        = "ingressRule"
+	TagHeaderNamePrefix   = "Cf-Warp-Tag-"
+	LogFieldCFRay         = "cfRay"
+	LogFieldRule          = "ingressRule"
+	LogFieldOriginService = "originService"
 )
 
 type proxy struct {
@@ -30,6 +33,8 @@ type proxy struct {
 	log          *zerolog.Logger
 	bufferPool   *bufferPool
 }
+
+var switchingProtocolText = fmt.Sprintf("%d %s", http.StatusSwitchingProtocols, http.StatusText(http.StatusSwitchingProtocols))
 
 func NewOriginProxy(
 	ingressRules ingress.Ingress,
@@ -69,8 +74,14 @@ func (p *proxy) Proxy(w connection.ResponseWriter, req *http.Request, sourceConn
 			lbProbe: lbProbe,
 			rule:    ingress.ServiceWarpRouting,
 		}
-		if err := p.proxyStreamRequest(serveCtx, w, req, p.warpRouting.Proxy, logFields); err != nil {
-			p.logRequestError(err, cfRay, ingress.ServiceWarpRouting)
+
+		host, err := getRequestHost(req)
+		if err != nil {
+			err = fmt.Errorf(`cloudflared recieved a warp-routing request with an empty host value: %v`, err)
+			return err
+		}
+		if err := p.proxyStreamRequest(serveCtx, w, host, req, p.warpRouting.Proxy, logFields); err != nil {
+			p.logRequestError(err, cfRay, "", ingress.ServiceWarpRouting)
 			return err
 		}
 		return nil
@@ -84,56 +95,91 @@ func (p *proxy) Proxy(w connection.ResponseWriter, req *http.Request, sourceConn
 	}
 	p.logRequest(req, logFields)
 
-	if sourceConnectionType == connection.TypeHTTP {
-		if err := p.proxyHTTPRequest(w, req, rule, logFields); err != nil {
-			p.logRequestError(err, cfRay, ruleField(p.ingressRules, ruleNum))
+	switch originProxy := rule.Service.(type) {
+	case ingress.HTTPOriginProxy:
+		if err := p.proxyHTTPRequest(w, req, originProxy, sourceConnectionType == connection.TypeWebsocket,
+			rule.Config.DisableChunkedEncoding, logFields); err != nil {
+			rule, srv := ruleField(p.ingressRules, ruleNum)
+			p.logRequestError(err, cfRay, rule, srv)
 			return err
 		}
 		return nil
-	}
 
-	connectionProxy, ok := rule.Service.(ingress.StreamBasedOriginProxy)
-	if !ok {
-		p.log.Error().Msgf("%s is not a connection-oriented service", rule.Service)
-		return fmt.Errorf("Not a connection-oriented service")
-	}
-
-	if err := p.proxyStreamRequest(serveCtx, w, req, connectionProxy, logFields); err != nil {
-		p.logRequestError(err, cfRay, ruleField(p.ingressRules, ruleNum))
-		return err
-	}
-	return nil
-}
-
-func ruleField(ing ingress.Ingress, ruleNum int) string {
-	if ing.IsSingleRule() {
-		return ""
-	}
-	return fmt.Sprintf("%d", ruleNum)
-}
-
-func (p *proxy) proxyHTTPRequest(w connection.ResponseWriter, req *http.Request, rule *ingress.Rule, fields logFields) error {
-	// Support for WSGI Servers by switching transfer encoding from chunked to gzip/deflate
-	if rule.Config.DisableChunkedEncoding {
-		req.TransferEncoding = []string{"gzip", "deflate"}
-		cLength, err := strconv.Atoi(req.Header.Get("Content-Length"))
-		if err == nil {
-			req.ContentLength = int64(cLength)
+	case ingress.StreamBasedOriginProxy:
+		dest, err := getDestFromRule(rule, req)
+		if err != nil {
+			return err
 		}
+		if err := p.proxyStreamRequest(serveCtx, w, dest, req, originProxy, logFields); err != nil {
+			rule, srv := ruleField(p.ingressRules, ruleNum)
+			p.logRequestError(err, cfRay, rule, srv)
+			return err
+		}
+		return nil
+	default:
+		return fmt.Errorf("Unrecognized service: %s, %t", rule.Service, originProxy)
+	}
+}
+
+func getDestFromRule(rule *ingress.Rule, req *http.Request) (string, error) {
+	switch rule.Service.String() {
+	case ingress.ServiceBastion:
+		return carrier.ResolveBastionDest(req)
+	default:
+		return rule.Service.String(), nil
+	}
+}
+
+// getRequestHost returns the host of the http.Request.
+func getRequestHost(r *http.Request) (string, error) {
+	if r.Host != "" {
+		return r.Host, nil
+	}
+	if r.URL != nil {
+		return r.URL.Host, nil
+	}
+	return "", errors.New("host not set in incoming request")
+}
+
+func ruleField(ing ingress.Ingress, ruleNum int) (ruleID string, srv string) {
+	srv = ing.Rules[ruleNum].Service.String()
+	if ing.IsSingleRule() {
+		return "", srv
+	}
+	return fmt.Sprintf("%d", ruleNum), srv
+}
+
+func (p *proxy) proxyHTTPRequest(
+	w connection.ResponseWriter,
+	req *http.Request,
+	httpService ingress.HTTPOriginProxy,
+	isWebsocket bool,
+	disableChunkedEncoding bool,
+	fields logFields) error {
+	roundTripReq := req
+	if isWebsocket {
+		roundTripReq = req.Clone(req.Context())
+		roundTripReq.Header.Set("Connection", "Upgrade")
+		roundTripReq.Header.Set("Upgrade", "websocket")
+		roundTripReq.Header.Set("Sec-Websocket-Version", "13")
+		roundTripReq.ContentLength = 0
+		roundTripReq.Body = nil
+	} else {
+		// Support for WSGI Servers by switching transfer encoding from chunked to gzip/deflate
+		if disableChunkedEncoding {
+			roundTripReq.TransferEncoding = []string{"gzip", "deflate"}
+			cLength, err := strconv.Atoi(req.Header.Get("Content-Length"))
+			if err == nil {
+				roundTripReq.ContentLength = int64(cLength)
+			}
+		}
+		// Request origin to keep connection alive to improve performance
+		roundTripReq.Header.Set("Connection", "keep-alive")
 	}
 
-	// Request origin to keep connection alive to improve performance
-	req.Header.Set("Connection", "keep-alive")
-
-	httpService, ok := rule.Service.(ingress.HTTPOriginProxy)
-	if !ok {
-		p.log.Error().Msgf("%s is not a http service", rule.Service)
-		return fmt.Errorf("Not a http service")
-	}
-
-	resp, err := httpService.RoundTrip(req)
+	resp, err := httpService.RoundTrip(roundTripReq)
 	if err != nil {
-		return errors.Wrap(err, "Error proxying request to origin")
+		return errors.Wrap(err, "Unable to reach the origin service. The service may be down or it may not be responding to traffic from cloudflared")
 	}
 	defer resp.Body.Close()
 
@@ -141,6 +187,23 @@ func (p *proxy) proxyHTTPRequest(w connection.ResponseWriter, req *http.Request,
 	if err != nil {
 		return errors.Wrap(err, "Error writing response header")
 	}
+
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		rwc, ok := resp.Body.(io.ReadWriteCloser)
+		if !ok {
+			return errors.New("internal error: unsupported connection type")
+		}
+		defer rwc.Close()
+
+		eyeballStream := &bidirectionalStream{
+			writer: w,
+			reader: req.Body,
+		}
+
+		websocket.Stream(eyeballStream, rwc, p.log)
+		return nil
+	}
+
 	if connection.IsServerSentEvent(resp.Header) {
 		p.log.Debug().Msg("Detected Server-Side Events from Origin")
 		p.writeEventStream(w, resp.Body)
@@ -160,16 +223,24 @@ func (p *proxy) proxyHTTPRequest(w connection.ResponseWriter, req *http.Request,
 func (p *proxy) proxyStreamRequest(
 	serveCtx context.Context,
 	w connection.ResponseWriter,
+	dest string,
 	req *http.Request,
 	connectionProxy ingress.StreamBasedOriginProxy,
 	fields logFields,
 ) error {
-	originConn, resp, err := connectionProxy.EstablishConnection(req)
+	originConn, err := connectionProxy.EstablishConnection(dest)
 	if err != nil {
 		return err
 	}
-	if resp.Body != nil {
-		defer resp.Body.Close()
+
+	resp := &http.Response{
+		Status:        switchingProtocolText,
+		StatusCode:    http.StatusSwitchingProtocols,
+		ContentLength: -1,
+	}
+
+	if secWebsocketKey := req.Header.Get("Sec-WebSocket-Key"); secWebsocketKey != "" {
+		resp.Header = websocket.NewResponseHeader(req)
 	}
 
 	if err = w.WriteRespHeaders(resp.StatusCode, resp.Header); err != nil {
@@ -271,7 +342,7 @@ func (p *proxy) logOriginResponse(resp *http.Response, fields logFields) {
 	}
 }
 
-func (p *proxy) logRequestError(err error, cfRay string, rule string) {
+func (p *proxy) logRequestError(err error, cfRay string, rule, service string) {
 	requestErrors.Inc()
 	log := p.log.Error().Err(err)
 	if cfRay != "" {
@@ -279,6 +350,9 @@ func (p *proxy) logRequestError(err error, cfRay string, rule string) {
 	}
 	if rule != "" {
 		log = log.Str(LogFieldRule, rule)
+	}
+	if service != "" {
+		log = log.Str(LogFieldOriginService, service)
 	}
 	log.Msg("")
 }
