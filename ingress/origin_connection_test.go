@@ -4,24 +4,22 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/gobwas/ws/wsutil"
-	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/proxy"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/cloudflare/cloudflared/logger"
 	"github.com/cloudflare/cloudflared/socks"
+	"github.com/cloudflare/cloudflared/stream"
 	"github.com/cloudflare/cloudflared/websocket"
 )
 
@@ -31,7 +29,6 @@ const (
 )
 
 var (
-	testLogger   = logger.Create(nil)
 	testMessage  = []byte("TestStreamOriginConnection")
 	testResponse = []byte(fmt.Sprintf("echo-%s", testMessage))
 )
@@ -39,7 +36,8 @@ var (
 func TestStreamTCPConnection(t *testing.T) {
 	cfdConn, originConn := net.Pipe()
 	tcpConn := tcpConnection{
-		conn: cfdConn,
+		Conn:         cfdConn,
+		writeTimeout: 30 * time.Second,
 	}
 
 	eyeballConn, edgeConn := net.Pipe()
@@ -50,6 +48,7 @@ func TestStreamTCPConnection(t *testing.T) {
 	errGroup, ctx := errgroup.WithContext(ctx)
 	errGroup.Go(func() error {
 		_, err := eyeballConn.Write(testMessage)
+		require.NoError(t, err)
 
 		readBuffer := make([]byte, len(testResponse))
 		_, err = eyeballConn.Read(readBuffer)
@@ -61,11 +60,11 @@ func TestStreamTCPConnection(t *testing.T) {
 	})
 	errGroup.Go(func() error {
 		echoTCPOrigin(t, originConn)
-		originConn.Close()
+		_ = originConn.Close()
 		return nil
 	})
 
-	tcpConn.Stream(ctx, edgeConn, testLogger)
+	tcpConn.Stream(ctx, edgeConn, TestLogger)
 	require.NoError(t, errGroup.Wait())
 }
 
@@ -88,16 +87,16 @@ func TestDefaultStreamWSOverTCPConnection(t *testing.T) {
 	})
 	errGroup.Go(func() error {
 		echoTCPOrigin(t, originConn)
-		originConn.Close()
+		_ = originConn.Close()
 		return nil
 	})
 
-	tcpOverWSConn.Stream(ctx, edgeConn, testLogger)
+	tcpOverWSConn.Stream(ctx, edgeConn, TestLogger)
 	require.NoError(t, errGroup.Wait())
 }
 
 // TestSocksStreamWSOverTCPConnection simulates proxying in socks mode.
-// Eyeball side runs cloudflared accesss tcp with --url flag to start a websocket forwarder which
+// Eyeball side runs cloudflared access tcp with --url flag to start a websocket forwarder which
 // wraps SOCKS5 traffic in websocket
 // Origin side runs a tcpOverWSConnection with socks.StreamHandler
 func TestSocksStreamWSOverTCPConnection(t *testing.T) {
@@ -116,15 +115,15 @@ func TestSocksStreamWSOverTCPConnection(t *testing.T) {
 	}
 	for _, status := range statusCodes {
 		handler := func(w http.ResponseWriter, r *http.Request) {
-			body, err := ioutil.ReadAll(r.Body)
-			require.NoError(t, err)
-			require.Equal(t, []byte(sendMessage), body)
+			body, err := io.ReadAll(r.Body)
+			assert.NoError(t, err)
+			assert.Equal(t, []byte(sendMessage), body)
 
-			require.Equal(t, echoHeaderIncomingValue, r.Header.Get(echoHeaderName))
+			assert.Equal(t, echoHeaderIncomingValue, r.Header.Get(echoHeaderName))
 			w.Header().Set(echoHeaderName, echoHeaderReturnValue)
 
 			w.WriteHeader(status)
-			w.Write([]byte(echoMessage))
+			_, _ = w.Write([]byte(echoMessage))
 		}
 		origin := httptest.NewServer(http.HandlerFunc(handler))
 		defer origin.Close()
@@ -146,7 +145,7 @@ func TestSocksStreamWSOverTCPConnection(t *testing.T) {
 
 		errGroup, ctx := errgroup.WithContext(ctx)
 		errGroup.Go(func() error {
-			tcpOverWSConn.Stream(ctx, edgeConn, testLogger)
+			tcpOverWSConn.Stream(ctx, edgeConn, TestLogger)
 			return nil
 		})
 
@@ -156,103 +155,93 @@ func TestSocksStreamWSOverTCPConnection(t *testing.T) {
 		errGroup.Go(func() error {
 			wsForwarderInConn, err := wsForwarderListener.Accept()
 			require.NoError(t, err)
-			defer wsForwarderInConn.Close()
+			defer func() { _ = wsForwarderInConn.Close() }()
 
-			websocket.Stream(wsForwarderInConn, &wsEyeball{wsForwarderOutConn}, testLogger)
+			stream.Pipe(wsForwarderInConn, &wsEyeball{wsForwarderOutConn}, TestLogger)
 			return nil
 		})
 
 		eyeballDialer, err := proxy.SOCKS5("tcp", wsForwarderListener.Addr().String(), nil, proxy.Direct)
 		require.NoError(t, err)
+		eyeballContextDialer, ok := eyeballDialer.(proxy.ContextDialer)
+		require.True(t, ok)
 
 		transport := &http.Transport{
-			Dial: eyeballDialer.Dial,
+			DialContext: eyeballContextDialer.DialContext,
 		}
 
 		// Request URL doesn't matter because the transport is using eyeballDialer to connectq
 		req, err := http.NewRequestWithContext(ctx, "GET", "http://test-socks-stream.com", bytes.NewBuffer([]byte(sendMessage)))
-		assert.NoError(t, err)
+		require.NoError(t, err)
+		defer func() { _ = req.Body.Close() }()
 		req.Header.Set(echoHeaderName, echoHeaderIncomingValue)
 
 		resp, err := transport.RoundTrip(req)
-		assert.NoError(t, err)
+		require.NoError(t, err)
+		defer func() { _ = resp.Body.Close() }()
 		assert.Equal(t, status, resp.StatusCode)
 		require.Equal(t, echoHeaderReturnValue, resp.Header.Get(echoHeaderName))
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Equal(t, []byte(echoMessage), body)
 
-		wsForwarderOutConn.Close()
-		edgeConn.Close()
-		tcpOverWSConn.Close()
+		_ = wsForwarderOutConn.Close()
+		_ = edgeConn.Close()
+		_ = tcpOverWSConn.Close()
 
 		require.NoError(t, errGroup.Wait())
 	}
 }
 
-func TestStreamWSConnection(t *testing.T) {
-	eyeballConn, edgeConn := net.Pipe()
+func TestWsConnReturnsBeforeStreamReturns(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		eyeballConn := &readWriter{
+			w: w,
+			r: r.Body,
+		}
 
-	origin := echoWSOrigin(t, true)
-	defer origin.Close()
-
-	var svc httpService
-	err := svc.start(&sync.WaitGroup{}, testLogger, nil, nil, OriginRequestConfig{
-		NoTLSVerify: true,
+		cfdConn, originConn := net.Pipe()
+		tcpOverWSConn := tcpOverWSConnection{
+			conn:          cfdConn,
+			streamHandler: DefaultStreamHandler,
+		}
+		go func() {
+			time.Sleep(time.Millisecond * 10)
+			// Simulate losing connection to origin
+			_ = originConn.Close()
+		}()
+		ctx := context.WithValue(r.Context(), websocket.PingPeriodContextKey, time.Microsecond)
+		tcpOverWSConn.Stream(ctx, eyeballConn, TestLogger)
 	})
-	require.NoError(t, err)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	client := server.Client()
 
-	req, err := http.NewRequest(http.MethodGet, origin.URL, nil)
-	require.NoError(t, err)
-	req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
-	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", "websocket")
-
-	conn, resp, err := svc.newWebsocketProxyConnection(req)
-
-	require.NoError(t, err)
-	defer conn.Close()
-
-	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
-	require.Equal(t, "Upgrade", resp.Header.Get("Connection"))
-	require.Equal(t, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", resp.Header.Get("Sec-Websocket-Accept"))
-	require.Equal(t, "websocket", resp.Header.Get("Upgrade"))
-
-	ctx, cancel := context.WithTimeout(context.Background(), testStreamTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
-	connClosed := make(chan struct{})
-
 	errGroup, ctx := errgroup.WithContext(ctx)
-	errGroup.Go(func() error {
-		select {
-		case <-connClosed:
-		case <-ctx.Done():
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			eyeballConn.Close()
-			edgeConn.Close()
-			conn.Close()
-		}
+	for i := 0; i < 50; i++ {
+		eyeballConn, edgeConn := net.Pipe()
+		req, err := http.NewRequestWithContext(ctx, http.MethodConnect, server.URL, edgeConn)
+		require.NoError(t, err)
+		defer func() { _ = req.Body.Close() }()
 
-		return ctx.Err()
-	})
+		resp, err := client.Transport.RoundTrip(req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		defer func() { _ = resp.Body.Close() }()
 
-	errGroup.Go(func() error {
-		echoWSEyeball(t, eyeballConn)
-		fmt.Println("closing pipe")
-		edgeConn.Close()
-		return eyeballConn.Close()
-	})
+		errGroup.Go(func() error {
+			for {
+				if err := wsutil.WriteClientBinary(eyeballConn, testMessage); err != nil {
+					return nil
+				}
+			}
+		})
+	}
 
-	errGroup.Go(func() error {
-		defer conn.Close()
-		conn.Stream(ctx, edgeConn, testLogger)
-		close(connClosed)
-		return nil
-	})
-
-	require.NoError(t, errGroup.Wait())
+	assert.NoError(t, errGroup.Wait())
 }
 
 type wsEyeball struct {
@@ -277,63 +266,34 @@ func echoWSEyeball(t *testing.T, conn net.Conn) {
 		assert.NoError(t, conn.Close())
 	}()
 
-	if !assert.NoError(t, wsutil.WriteClientBinary(conn, testMessage)) {
-		return
-	}
+	require.NoError(t, wsutil.WriteClientBinary(conn, testMessage))
 
 	readMsg, err := wsutil.ReadServerBinary(conn)
-	if !assert.NoError(t, err) {
-		return
-	}
+	require.NoError(t, err)
 
 	assert.Equal(t, testResponse, readMsg)
-}
-
-func echoWSOrigin(t *testing.T, expectMessages bool) *httptest.Server {
-	var upgrader = gorillaWS.Upgrader{
-		ReadBufferSize:  10,
-		WriteBufferSize: 10,
-	}
-
-	ws := func(w http.ResponseWriter, r *http.Request) {
-		header := make(http.Header)
-		for k, vs := range r.Header {
-			if k == "Test-Cloudflared-Echo" {
-				header[k] = vs
-			}
-		}
-		conn, err := upgrader.Upgrade(w, r, header)
-		require.NoError(t, err)
-		defer conn.Close()
-
-		sawMessage := false
-		for {
-			messageType, p, err := conn.ReadMessage()
-			if err != nil {
-				if expectMessages && !sawMessage {
-					t.Errorf("unexpected error: %v", err)
-				}
-				return
-			}
-			assert.Equal(t, testMessage, p)
-			sawMessage = true
-			if err := conn.WriteMessage(messageType, testResponse); err != nil {
-				return
-			}
-		}
-	}
-
-	// NewTLSServer starts the server in another thread
-	return httptest.NewTLSServer(http.HandlerFunc(ws))
 }
 
 func echoTCPOrigin(t *testing.T, conn net.Conn) {
 	readBuffer := make([]byte, len(testMessage))
 	_, err := conn.Read(readBuffer)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	assert.Equal(t, testMessage, readBuffer)
 
 	_, err = conn.Write(testResponse)
 	assert.NoError(t, err)
+}
+
+type readWriter struct {
+	w io.Writer
+	r io.Reader
+}
+
+func (r *readWriter) Read(p []byte) (n int, err error) {
+	return r.r.Read(p)
+}
+
+func (r *readWriter) Write(p []byte) (n int, err error) {
+	return r.w.Write(p)
 }

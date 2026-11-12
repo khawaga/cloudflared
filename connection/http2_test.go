@@ -1,10 +1,11 @@
 package connection
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,32 +14,91 @@ import (
 	"time"
 
 	"github.com/gobwas/ws/wsutil"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/http2"
 
+	"github.com/cloudflare/cloudflared/client"
+	"github.com/cloudflare/cloudflared/tracing"
+
+	"github.com/cloudflare/cloudflared/tunnelrpc"
 	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
-	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 )
 
-var (
-	testTransport = http2.Transport{}
-)
+func newTestHTTP2ClientConn(ctx context.Context, conn net.Conn) (*http.ClientConn, error) {
+	protocols := new(http.Protocols)
+	protocols.SetUnencryptedHTTP2(true)
+	transport := &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return conn, nil
+		},
+		Protocols: protocols,
+	}
+	return transport.NewClientConn(ctx, "http", "localhost:8080")
+}
 
-func newTestHTTP2Connection() (*http2Connection, net.Conn) {
-	edgeConn, originConn := net.Pipe()
-	var connIndex = uint8(0)
-	return NewHTTP2Connection(
-		originConn,
-		testConfig,
-		&NamedTunnelConfig{},
-		&pogs.ConnectionOptions{},
-		NewObserver(&log, &log, false),
-		connIndex,
+func newTestHTTP2Connection() (*HTTP2Connection, net.Conn) {
+	edgeConn, cfdConn := net.Pipe()
+	connIndex := uint8(0)
+	log := zerolog.Nop()
+	obs := NewObserver(&log)
+	controlStream := NewControlStream(
+		obs,
 		mockConnectedFuse{},
+		&TunnelProperties{},
+		connIndex,
 		nil,
+		nil,
+		1*time.Second,
+		nil,
+		1*time.Second,
+		HTTP2,
+	)
+	return NewHTTP2Connection(
+		cfdConn,
+		// OriginProxy is set in testConfigManager
+		testOrchestrator,
+		&client.ConnectionOptionsSnapshot{},
+		obs,
+		connIndex,
+		controlStream,
+		&log,
 	), edgeConn
+}
+
+func TestHTTP2ConfigurationSet(t *testing.T) {
+	http2Conn, edgeConn := newTestHTTP2Connection()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = http2Conn.Serve(ctx)
+	}()
+
+	edgeHTTP2Conn, err := newTestHTTP2ClientConn(t.Context(), edgeConn)
+	require.NoError(t, err)
+
+	reqBody := []byte(`{
+"version": 2,
+"config": {"warp-routing": {"enabled": true},  "originRequest" : {"connectTimeout": 10}, "ingress" : [ {"hostname": "test", "service": "https://localhost:8000" } , {"service": "http_status:404"} ]}}
+`)
+	reader := bytes.NewReader(reqBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://localhost:8080/ok", reader)
+	require.NoError(t, err)
+	req.Header.Set(InternalUpgradeHeader, ConfigurationUpdate)
+
+	resp, err := edgeHTTP2Conn.RoundTrip(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	bdy, err := io.ReadAll(resp.Body)
+	defer func() { _ = resp.Body.Close() }()
+	require.NoError(t, err)
+	assert.Equal(t, `{"lastAppliedVersion":2,"err":null}`, string(bdy))
+	cancel()
+	wg.Wait()
 }
 
 func TestServeHTTP(t *testing.T) {
@@ -78,15 +138,15 @@ func TestServeHTTP(t *testing.T) {
 
 	http2Conn, edgeConn := newTestHTTP2Connection()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		http2Conn.Serve(ctx)
+		_ = http2Conn.Serve(ctx)
 	}()
 
-	edgeHTTP2Conn, err := testTransport.NewClientConn(edgeConn)
+	edgeHTTP2Conn, err := newTestHTTP2ClientConn(t.Context(), edgeConn)
 	require.NoError(t, err)
 
 	for _, test := range tests {
@@ -98,10 +158,11 @@ func TestServeHTTP(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, test.expectedStatus, resp.StatusCode)
 		if test.expectedBody != nil {
-			respBody, err := ioutil.ReadAll(resp.Body)
+			respBody, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 			require.Equal(t, test.expectedBody, respBody)
 		}
+		_ = resp.Body.Close()
 		if test.isProxyError {
 			require.Equal(t, responseMetaHeaderCfd, resp.Header.Get(ResponseMetaHeader))
 		} else {
@@ -118,22 +179,32 @@ type mockNamedTunnelRPCClient struct {
 	unregistered chan struct{}
 }
 
-func (mc mockNamedTunnelRPCClient) RegisterConnection(
-	c context.Context,
-	config *NamedTunnelConfig,
-	options *tunnelpogs.ConnectionOptions,
-	connIndex uint8,
-	observer *Observer,
-) error {
-	if mc.shouldFail != nil {
-		return mc.shouldFail
-	}
-	close(mc.registered)
+func (mc mockNamedTunnelRPCClient) SendLocalConfiguration(c context.Context, config []byte) error {
 	return nil
 }
 
-func (mc mockNamedTunnelRPCClient) GracefulShutdown(ctx context.Context, gracePeriod time.Duration) {
+func (mc mockNamedTunnelRPCClient) RegisterConnection(
+	ctx context.Context,
+	auth pogs.TunnelAuth,
+	tunnelID uuid.UUID,
+	options *pogs.ConnectionOptions,
+	connIndex uint8,
+	edgeAddress net.IP,
+) (*pogs.ConnectionDetails, error) {
+	if mc.shouldFail != nil {
+		return nil, mc.shouldFail
+	}
+	close(mc.registered)
+	return &pogs.ConnectionDetails{
+		Location:                "LIS",
+		UUID:                    uuid.New(),
+		TunnelIsRemotelyManaged: false,
+	}, nil
+}
+
+func (mc mockNamedTunnelRPCClient) GracefulShutdown(ctx context.Context, gracePeriod time.Duration) error {
 	close(mc.unregistered)
+	return nil
 }
 
 func (mockNamedTunnelRPCClient) Close() {}
@@ -144,8 +215,8 @@ type mockRPCClientFactory struct {
 	unregistered chan struct{}
 }
 
-func (mf *mockRPCClientFactory) newMockRPCClient(context.Context, io.ReadWriteCloser, *zerolog.Logger) NamedTunnelRPCClient {
-	return mockNamedTunnelRPCClient{
+func (mf *mockRPCClientFactory) newMockRPCClient(context.Context, io.ReadWriteCloser, time.Duration) tunnelrpc.RegistrationClient {
+	return &mockNamedTunnelRPCClient{
 		shouldFail:   mf.shouldFail,
 		registered:   mf.registered,
 		unregistered: mf.unregistered,
@@ -156,6 +227,8 @@ type wsRespWriter struct {
 	*httptest.ResponseRecorder
 	readPipe  *io.PipeReader
 	writePipe *io.PipeWriter
+	closed    bool
+	panicked  bool
 }
 
 func newWSRespWriter() *wsRespWriter {
@@ -164,7 +237,17 @@ func newWSRespWriter() *wsRespWriter {
 		httptest.NewRecorder(),
 		readPipe,
 		writePipe,
+		false,
+		false,
 	}
+}
+
+type nowriter struct {
+	io.Reader
+}
+
+func (nowriter) Write(_ []byte) (int, error) {
+	return 0, fmt.Errorf("writer not implemented")
 }
 
 func (w *wsRespWriter) RespBody() io.ReadWriter {
@@ -172,48 +255,112 @@ func (w *wsRespWriter) RespBody() io.ReadWriter {
 }
 
 func (w *wsRespWriter) Write(data []byte) (n int, err error) {
+	if w.closed {
+		w.panicked = true
+		return 0, errors.New("wsRespWriter panicked")
+	}
 	return w.writePipe.Write(data)
+}
+
+func (w *wsRespWriter) close() {
+	w.closed = true
 }
 
 func TestServeWS(t *testing.T) {
 	http2Conn, _ := newTestHTTP2Connection()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		http2Conn.Serve(ctx)
-	}()
+	ctx, cancel := context.WithCancel(t.Context())
 
 	respWriter := newWSRespWriter()
 	readPipe, writePipe := io.Pipe()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8080/ws", readPipe)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8080/ws/echo", readPipe)
 	require.NoError(t, err)
 	req.Header.Set(InternalUpgradeHeader, WebsocketUpgrade)
 
-	wg.Add(1)
+	serveDone := make(chan struct{})
 	go func() {
-		defer wg.Done()
+		defer close(serveDone)
 		http2Conn.ServeHTTP(respWriter, req)
+		respWriter.close()
 	}()
 
 	data := []byte("test websocket")
-	err = wsutil.WriteClientText(writePipe, data)
+	err = wsutil.WriteClientBinary(writePipe, data)
 	require.NoError(t, err)
 
-	respBody, err := wsutil.ReadServerText(respWriter.RespBody())
+	respBody, err := wsutil.ReadServerBinary(respWriter.RespBody())
 	require.NoError(t, err)
-	require.Equal(t, data, respBody, fmt.Sprintf("Expect %s, got %s", string(data), string(respBody)))
+	require.Equal(t, data, respBody, "expect %s, got %s", string(data), string(respBody))
 
 	cancel()
 	resp := respWriter.Result()
+	defer func() { _ = resp.Body.Close() }()
 	// http2RespWriter should rewrite status 101 to 200
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, responseMetaHeaderOrigin, resp.Header.Get(ResponseMetaHeader))
 
+	<-serveDone
+	require.False(t, respWriter.panicked)
+}
+
+// TestNoWriteAfterServeHTTPReturns is a regression test of https://jira.cfdata.org/browse/TUN-5184
+// to make sure we don't write to the ResponseWriter after the ServeHTTP method returns
+func TestNoWriteAfterServeHTTPReturns(t *testing.T) {
+	cfdHTTP2Conn, edgeTCPConn := newTestHTTP2Connection()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	var wg sync.WaitGroup
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		_ = cfdHTTP2Conn.Serve(ctx)
+	}()
+
+	edgeHTTP2Conn, err := newTestHTTP2ClientConn(t.Context(), edgeTCPConn)
+	require.NoError(t, err)
+	message := []byte(t.Name())
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			readPipe, writePipe := io.Pipe()
+			reqCtx, reqCancel := context.WithCancel(ctx)
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://localhost:8080/ws/flaky", readPipe)
+			assert.NoError(t, err)
+
+			req.Header.Set(InternalUpgradeHeader, WebsocketUpgrade)
+
+			resp, err := edgeHTTP2Conn.RoundTrip(req)
+			assert.NoError(t, err)
+			_ = resp.Body.Close()
+
+			// http2RespWriter should rewrite status 101 to 200
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-reqCtx.Done():
+						return
+					default:
+					}
+					_ = wsutil.WriteClientBinary(writePipe, message)
+				}
+			}()
+
+			time.Sleep(time.Millisecond * 100)
+			reqCancel()
+		}()
+	}
+
 	wg.Wait()
+	cancel()
+	<-serverDone
 }
 
 func TestServeControlStream(t *testing.T) {
@@ -223,27 +370,42 @@ func TestServeControlStream(t *testing.T) {
 		registered:   make(chan struct{}),
 		unregistered: make(chan struct{}),
 	}
-	http2Conn.newRPCClientFunc = rpcClientFactory.newMockRPCClient
 
-	ctx, cancel := context.WithCancel(context.Background())
+	obs := NewObserver(&log)
+	controlStream := NewControlStream(
+		obs,
+		mockConnectedFuse{},
+		&TunnelProperties{},
+		1,
+		nil,
+		rpcClientFactory.newMockRPCClient,
+		1*time.Second,
+		nil,
+		1*time.Second,
+		HTTP2,
+	)
+	http2Conn.controlStreamHandler = controlStream
+
+	ctx, cancel := context.WithCancel(t.Context())
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		http2Conn.Serve(ctx)
+		_ = http2Conn.Serve(ctx)
 	}()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8080/", nil)
 	require.NoError(t, err)
 	req.Header.Set(InternalUpgradeHeader, ControlStreamUpgrade)
 
-	edgeHTTP2Conn, err := testTransport.NewClientConn(edgeConn)
+	edgeHTTP2Conn, err := newTestHTTP2ClientConn(t.Context(), edgeConn)
 	require.NoError(t, err)
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		edgeHTTP2Conn.RoundTrip(req)
+		// nolint: bodyclose
+		_, _ = edgeHTTP2Conn.RoundTrip(req)
 	}()
 
 	<-rpcClientFactory.registered
@@ -258,31 +420,46 @@ func TestFailRegistration(t *testing.T) {
 	http2Conn, edgeConn := newTestHTTP2Connection()
 
 	rpcClientFactory := mockRPCClientFactory{
-		shouldFail:   errDuplicationConnection,
+		shouldFail:   errors.New(DuplicateConnectionError),
 		registered:   make(chan struct{}),
 		unregistered: make(chan struct{}),
 	}
-	http2Conn.newRPCClientFunc = rpcClientFactory.newMockRPCClient
 
-	ctx, cancel := context.WithCancel(context.Background())
+	obs := NewObserver(&log)
+	controlStream := NewControlStream(
+		obs,
+		mockConnectedFuse{},
+		&TunnelProperties{},
+		http2Conn.connIndex,
+		nil,
+		rpcClientFactory.newMockRPCClient,
+		1*time.Second,
+		nil,
+		1*time.Second,
+		HTTP2,
+	)
+	http2Conn.controlStreamHandler = controlStream
+
+	ctx, cancel := context.WithCancel(t.Context())
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		http2Conn.Serve(ctx)
+		_ = http2Conn.Serve(ctx)
 	}()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8080/", nil)
 	require.NoError(t, err)
 	req.Header.Set(InternalUpgradeHeader, ControlStreamUpgrade)
 
-	edgeHTTP2Conn, err := testTransport.NewClientConn(edgeConn)
+	edgeHTTP2Conn, err := newTestHTTP2ClientConn(t.Context(), edgeConn)
 	require.NoError(t, err)
 	resp, err := edgeHTTP2Conn.RoundTrip(req)
 	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
 
-	assert.NotNil(t, http2Conn.controlStreamErr)
+	require.ErrorIs(t, http2Conn.controlStreamErr, ErrDuplicateConnection)
 	cancel()
 	wg.Wait()
 }
@@ -295,35 +472,50 @@ func TestGracefulShutdownHTTP2(t *testing.T) {
 		unregistered: make(chan struct{}),
 	}
 	events := &eventCollectorSink{}
-	http2Conn.newRPCClientFunc = rpcClientFactory.newMockRPCClient
-	http2Conn.observer.RegisterSink(events)
-	shutdownC := make(chan struct{})
-	http2Conn.gracefulShutdownC = shutdownC
 
-	ctx, cancel := context.WithCancel(context.Background())
+	shutdownC := make(chan struct{})
+	obs := NewObserver(&log)
+	obs.RegisterSink(events)
+	controlStream := NewControlStream(
+		obs,
+		mockConnectedFuse{},
+		&TunnelProperties{},
+		http2Conn.connIndex,
+		nil,
+		rpcClientFactory.newMockRPCClient,
+		1*time.Second,
+		shutdownC,
+		1*time.Second,
+		HTTP2,
+	)
+
+	http2Conn.controlStreamHandler = controlStream
+
+	ctx, cancel := context.WithCancel(t.Context())
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		http2Conn.Serve(ctx)
+		_ = http2Conn.Serve(ctx)
 	}()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8080/", nil)
 	require.NoError(t, err)
 	req.Header.Set(InternalUpgradeHeader, ControlStreamUpgrade)
 
-	edgeHTTP2Conn, err := testTransport.NewClientConn(edgeConn)
+	edgeHTTP2Conn, err := newTestHTTP2ClientConn(t.Context(), edgeConn)
 	require.NoError(t, err)
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// nolint: bodyclose
 		_, _ = edgeHTTP2Conn.RoundTrip(req)
 	}()
 
 	select {
 	case <-rpcClientFactory.registered:
-		break //ok
+		break // ok
 	case <-time.Tick(time.Second):
 		t.Fatal("timeout out waiting for registration")
 	}
@@ -333,11 +525,11 @@ func TestGracefulShutdownHTTP2(t *testing.T) {
 
 	select {
 	case <-rpcClientFactory.unregistered:
-		break //ok
+		break // ok
 	case <-time.Tick(time.Second):
 		t.Fatal("timeout out waiting for unregistered signal")
 	}
-	assert.True(t, http2Conn.stoppedGracefully)
+	assert.True(t, controlStream.IsStopped())
 
 	cancel()
 	wg.Wait()
@@ -348,22 +540,52 @@ func TestGracefulShutdownHTTP2(t *testing.T) {
 	})
 }
 
-func benchmarkServeHTTP(b *testing.B, test testRequest) {
+func TestServeTCP_RateLimited(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
 	http2Conn, edgeConn := newTestHTTP2Connection()
 
-	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		http2Conn.Serve(ctx)
+		_ = http2Conn.Serve(ctx)
+	}()
+
+	edgeHTTP2Conn, err := newTestHTTP2ClientConn(t.Context(), edgeConn)
+	require.NoError(t, err)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8080", nil)
+	require.NoError(t, err)
+	req.Header.Set(InternalTCPProxySrcHeader, "tcp")
+	req.Header.Set(tracing.TracerContextName, "flow-rate-limited")
+
+	resp, err := edgeHTTP2Conn.RoundTrip(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	require.Equal(t, responseMetaHeaderCfdFlowRateLimited, resp.Header.Get(ResponseMetaHeader))
+
+	cancel()
+	wg.Wait()
+}
+
+func benchmarkServeHTTP(b *testing.B, test testRequest) {
+	http2Conn, edgeConn := newTestHTTP2Connection()
+
+	ctx, cancel := context.WithCancel(b.Context())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = http2Conn.Serve(ctx)
 	}()
 
 	endpoint := fmt.Sprintf("http://localhost:8080/%s", test.endpoint)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	require.NoError(b, err)
 
-	edgeHTTP2Conn, err := testTransport.NewClientConn(edgeConn)
+	edgeHTTP2Conn, err := newTestHTTP2ClientConn(b.Context(), edgeConn)
 	require.NoError(b, err)
 
 	b.ResetTimer()
@@ -374,11 +596,11 @@ func benchmarkServeHTTP(b *testing.B, test testRequest) {
 		require.NoError(b, err)
 		require.Equal(b, test.expectedStatus, resp.StatusCode)
 		if test.expectedBody != nil {
-			respBody, err := ioutil.ReadAll(resp.Body)
+			respBody, err := io.ReadAll(resp.Body)
 			require.NoError(b, err)
 			require.Equal(b, test.expectedBody, respBody)
 		}
-		resp.Body.Close()
+		require.NoError(b, resp.Body.Close())
 	}
 
 	cancel()

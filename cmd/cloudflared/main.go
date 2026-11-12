@@ -2,25 +2,28 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
+	"os"
 	"strings"
 	"time"
 
-	"github.com/getsentry/raven-go"
-	homedir "github.com/mitchellh/go-homedir"
-	"github.com/pkg/errors"
+	"github.com/getsentry/sentry-go"
 	"github.com/urfave/cli/v2"
 	"go.uber.org/automaxprocs/maxprocs"
 
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/access"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
+	cfdflags "github.com/cloudflare/cloudflared/cmd/cloudflared/flags"
+	"github.com/cloudflare/cloudflared/cmd/cloudflared/management"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/proxydns"
+	"github.com/cloudflare/cloudflared/cmd/cloudflared/tail"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/tunnel"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/updater"
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/logger"
 	"github.com/cloudflare/cloudflared/metrics"
 	"github.com/cloudflare/cloudflared/overwatch"
+	"github.com/cloudflare/cloudflared/token"
+	"github.com/cloudflare/cloudflared/tracing"
 	"github.com/cloudflare/cloudflared/watcher"
 )
 
@@ -31,6 +34,7 @@ const (
 var (
 	Version   = "DEV"
 	BuildTime = "unknown"
+	BuildType = ""
 	// Mostly network errors that we don't want reported back to Sentry, this is done by substring match.
 	ignoredErrors = []string{
 		"connection reset by peer",
@@ -45,10 +49,11 @@ var (
 )
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-	metrics.RegisterBuildInfo(BuildTime, Version)
-	raven.SetRelease(Version)
-	maxprocs.Set()
+	// FIXME: TUN-8148: Disable QUIC_GO ECN due to bugs in proper detection if supported
+	os.Setenv("QUIC_GO_DISABLE_ECN", "1")
+	metrics.RegisterBuildInfo(BuildType, BuildTime, Version)
+	_, _ = maxprocs.Set()
+	bInfo := cliutil.GetBuildInfo(BuildType, Version)
 
 	// Graceful shutdown channel used by the app. When closed, app must terminate gracefully.
 	// Windows service manager closes this channel when it receives stop command.
@@ -67,23 +72,27 @@ func main() {
 	app.Copyright = fmt.Sprintf(
 		`(c) %d Cloudflare Inc.
    Your installation of cloudflared software constitutes a symbol of your signature indicating that you accept
-   the terms of the Cloudflare License (https://developers.cloudflare.com/argo-tunnel/license/),
+   the terms of the Apache License Version 2.0 (https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/license),
    Terms (https://www.cloudflare.com/terms/) and Privacy Policy (https://www.cloudflare.com/privacypolicy/).`,
 		time.Now().Year(),
 	)
-	app.Version = fmt.Sprintf("%s (built %s)", Version, BuildTime)
+	app.Version = fmt.Sprintf("%s (built %s%s)", Version, BuildTime, bInfo.GetBuildTypeMsg())
 	app.Description = `cloudflared connects your machine or user identity to Cloudflare's global network.
 	You can use it to authenticate a session to reach an API behind Access, route web traffic to this machine,
 	and configure access control.
 
-	See https://developers.cloudflare.com/argo-tunnel/ for more in-depth documentation.`
+	See https://developers.cloudflare.com/cloudflare-one/connections/connect-apps for more in-depth documentation.`
 	app.Flags = flags()
 	app.Action = action(graceShutdownC)
 	app.Commands = commands(cli.ShowVersion)
 
-	tunnel.Init(Version, graceShutdownC) // we need this to support the tunnel sub command...
-	access.Init(graceShutdownC)
-	updater.Init(Version)
+	tunnel.Init(bInfo, graceShutdownC) // we need this to support the tunnel sub command...
+	access.Init(graceShutdownC, Version)
+	updater.Init(bInfo)
+	tracing.Init(Version)
+	token.Init(Version)
+	tail.Init(bInfo)
+	management.Init(bInfo)
 	runApp(app, graceShutdownC)
 }
 
@@ -99,7 +108,7 @@ func commands(version func(c *cli.Context)) []*cli.Command {
 					Usage: "specify if you wish to update to the latest beta version",
 				},
 				&cli.BoolFlag{
-					Name:   "force",
+					Name:   cfdflags.Force,
 					Usage:  "specify if you wish to force an upgrade to the latest version regardless of the current version",
 					Hidden: true,
 				},
@@ -123,16 +132,29 @@ To determine if an update happened in a script, check for error code 11.`,
 		{
 			Name: "version",
 			Action: func(c *cli.Context) (err error) {
+				if c.Bool("short") {
+					fmt.Println(strings.Split(c.App.Version, " ")[0])
+					return nil
+				}
 				version(c)
 				return nil
 			},
 			Usage:       versionText,
 			Description: versionText,
+			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:    "short",
+					Aliases: []string{"s"},
+					Usage:   "print just the version number",
+				},
+			},
 		},
 	}
 	cmds = append(cmds, tunnel.Commands()...)
-	cmds = append(cmds, proxydns.Command(false))
+	cmds = append(cmds, proxydns.Command()) // removed feature, only here for error message
 	cmds = append(cmds, access.Commands()...)
+	cmds = append(cmds, tail.Command())
+	cmds = append(cmds, management.Command())
 	return cmds
 }
 
@@ -150,27 +172,15 @@ func action(graceShutdownC chan struct{}) cli.ActionFunc {
 		if isEmptyInvocation(c) {
 			return handleServiceMode(c, graceShutdownC)
 		}
-		tags := make(map[string]string)
-		tags["hostname"] = c.String("hostname")
-		raven.SetTagsContext(tags)
-		raven.CapturePanic(func() { err = tunnel.TunnelCommand(c) }, nil)
+		func() {
+			defer sentry.Recover()
+			err = tunnel.TunnelCommand(c)
+		}()
 		if err != nil {
 			captureError(err)
 		}
 		return err
 	})
-}
-
-func userHomeDir() (string, error) {
-	// This returns the home dir of the executing user using OS-specific method
-	// for discovering the home dir. It's not recommended to call this function
-	// when the user has root permission as $HOME depends on what options the user
-	// use with sudo.
-	homeDir, err := homedir.Dir()
-	if err != nil {
-		return "", errors.Wrap(err, "Cannot determine home directory for the user")
-	}
-	return homeDir, nil
 }
 
 // In order to keep the amount of noise sent to Sentry low, typical network errors can be filtered out here by a substring match.
@@ -181,7 +191,7 @@ func captureError(err error) {
 			return
 		}
 	}
-	raven.CaptureError(err, nil)
+	sentry.CaptureException(err)
 }
 
 // cloudflared was started without any flags

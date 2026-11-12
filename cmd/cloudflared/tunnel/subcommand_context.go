@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,119 +9,93 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 	"github.com/urfave/cli/v2"
 
-	"github.com/cloudflare/cloudflared/certutil"
+	"github.com/cloudflare/cloudflared/cfapi"
+	cfdflags "github.com/cloudflare/cloudflared/cmd/cloudflared/flags"
 	"github.com/cloudflare/cloudflared/connection"
+	"github.com/cloudflare/cloudflared/credentials"
 	"github.com/cloudflare/cloudflared/logger"
-	"github.com/cloudflare/cloudflared/tunnelstore"
 )
 
-type errInvalidJSONCredential struct {
+const fedRampBaseApiURL = "https://api.fed.cloudflare.com/client/v4"
+
+type invalidJSONCredentialError struct {
 	err  error
 	path string
 }
 
-func (e errInvalidJSONCredential) Error() string {
+func (e invalidJSONCredentialError) Error() string {
 	return "Invalid JSON when parsing tunnel credentials file"
 }
 
 // subcommandContext carries structs shared between subcommands, to reduce number of arguments needed to
 // pass between subcommands, and make sure they are only initialized once
 type subcommandContext struct {
-	c           *cli.Context
-	log         *zerolog.Logger
-	isUIEnabled bool
-	fs          fileSystem
+	c   *cli.Context
+	log *zerolog.Logger
+	fs  fileSystem
 
 	// These fields should be accessed using their respective Getter
-	tunnelstoreClient tunnelstore.Client
-	userCredential    *userCredential
+	tunnelstoreClient cfapi.Client
+	userCredential    *credentials.User
 }
 
 func newSubcommandContext(c *cli.Context) (*subcommandContext, error) {
-	isUIEnabled := c.IsSet(uiFlag) && c.String("name") != ""
-
-	// If UI is enabled, terminal log output should be disabled -- log should be written into a UI log window instead
-	log := logger.CreateLoggerFromContext(c, isUIEnabled)
-
 	return &subcommandContext{
-		c:           c,
-		log:         log,
-		isUIEnabled: isUIEnabled,
-		fs:          realFileSystem{},
+		c:   c,
+		log: logger.CreateLoggerFromContext(c, logger.EnableTerminalLog),
+		fs:  realFileSystem{},
 	}, nil
 }
 
 // Returns something that can find the given tunnel's credentials file.
 func (sc *subcommandContext) credentialFinder(tunnelID uuid.UUID) CredFinder {
 	if path := sc.c.String(CredFileFlag); path != "" {
-		return newStaticPath(path, sc.fs)
+		// Expand path if CredFileFlag contains `~`
+		absPath, err := homedir.Expand(path)
+		if err != nil {
+			return newStaticPath(path, sc.fs)
+		}
+		return newStaticPath(absPath, sc.fs)
 	}
 	return newSearchByID(tunnelID, sc.c, sc.log, sc.fs)
 }
 
-type userCredential struct {
-	cert     *certutil.OriginCert
-	certPath string
-}
-
-func (sc *subcommandContext) client() (tunnelstore.Client, error) {
+func (sc *subcommandContext) client() (cfapi.Client, error) {
 	if sc.tunnelstoreClient != nil {
 		return sc.tunnelstoreClient, nil
 	}
-	credential, err := sc.credential()
+	cred, err := sc.credential()
 	if err != nil {
 		return nil, err
 	}
-	userAgent := fmt.Sprintf("cloudflared/%s", version)
-	client, err := tunnelstore.NewRESTClient(
-		sc.c.String("api-url"),
-		credential.cert.AccountID,
-		credential.cert.ZoneID,
-		credential.cert.ServiceKey,
-		userAgent,
-		sc.log,
-	)
 
+	var apiURL string
+	if cred.IsFEDEndpoint() {
+		sc.log.Info().Str("api-url", fedRampBaseApiURL).Msg("using fedramp base api")
+		apiURL = fedRampBaseApiURL
+	} else {
+		apiURL = sc.c.String(cfdflags.ApiURL)
+	}
+
+	sc.tunnelstoreClient, err = cred.Client(apiURL, buildInfo.UserAgent(), sc.log)
 	if err != nil {
 		return nil, err
 	}
-	sc.tunnelstoreClient = client
-	return client, nil
+	return sc.tunnelstoreClient, nil
 }
 
-func (sc *subcommandContext) credential() (*userCredential, error) {
+func (sc *subcommandContext) credential() (*credentials.User, error) {
 	if sc.userCredential == nil {
-		originCertPath := sc.c.String("origincert")
-		originCertLog := sc.log.With().
-			Str(LogFieldOriginCertPath, originCertPath).
-			Logger()
-
-		originCertPath, err := findOriginCert(originCertPath, &originCertLog)
+		uc, err := credentials.Read(sc.c.String(cfdflags.OriginCert), sc.log)
 		if err != nil {
-			return nil, errors.Wrap(err, "Error locating origin cert")
+			return nil, err
 		}
-		blocks, err := readOriginCert(originCertPath)
-		if err != nil {
-			return nil, errors.Wrapf(err, "Can't read origin cert from %s", originCertPath)
-		}
-
-		cert, err := certutil.DecodeOriginCert(blocks)
-		if err != nil {
-			return nil, errors.Wrap(err, "Error decoding origin cert")
-		}
-
-		if cert.AccountID == "" {
-			return nil, errors.Errorf(`Origin certificate needs to be refreshed before creating new tunnels.\nDelete %s and run "cloudflared login" to obtain a new cert.`, originCertPath)
-		}
-
-		sc.userCredential = &userCredential{
-			cert:     cert,
-			certPath: originCertPath,
-		}
+		sc.userCredential = uc
 	}
 	return sc.userCredential, nil
 }
@@ -137,26 +112,38 @@ func (sc *subcommandContext) readTunnelCredentials(credFinder CredFinder) (conne
 
 	var credentials connection.Credentials
 	if err = json.Unmarshal(body, &credentials); err != nil {
-		if strings.HasSuffix(filePath, ".pem") {
+		if filepath.Ext(filePath) == ".pem" {
 			return connection.Credentials{}, fmt.Errorf("The tunnel credentials file should be .json but you gave a .pem. " +
 				"The tunnel credentials file was originally created by `cloudflared tunnel create`. " +
 				"You may have accidentally used the filepath to cert.pem, which is generated by `cloudflared tunnel " +
 				"login`.")
 		}
-		return connection.Credentials{}, errInvalidJSONCredential{path: filePath, err: err}
+		return connection.Credentials{}, invalidJSONCredentialError{path: filePath, err: err}
 	}
 	return credentials, nil
 }
 
-func (sc *subcommandContext) create(name string, credentialsFilePath string) (*tunnelstore.Tunnel, error) {
+func (sc *subcommandContext) create(name string, credentialsFilePath string, secret string) (*cfapi.Tunnel, error) {
 	client, err := sc.client()
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't create client to talk to Argo Tunnel backend")
+		return nil, errors.Wrap(err, "couldn't create client to talk to Cloudflare Tunnel backend")
 	}
 
-	tunnelSecret, err := generateTunnelSecret()
-	if err != nil {
-		return nil, errors.Wrap(err, "couldn't generate the secret for your new tunnel")
+	var tunnelSecret []byte
+	if secret == "" {
+		tunnelSecret, err = generateTunnelSecret()
+		if err != nil {
+			return nil, errors.Wrap(err, "couldn't generate the secret for your new tunnel")
+		}
+	} else {
+		decodedSecret, err := base64.StdEncoding.DecodeString(secret)
+		if err != nil {
+			return nil, errors.Wrap(err, "Couldn't decode tunnel secret from base64")
+		}
+		tunnelSecret = decodedSecret
+		if len(tunnelSecret) < 32 {
+			return nil, errors.New("Decoded tunnel secret must be at least 32 bytes long")
+		}
 	}
 
 	tunnel, err := client.CreateTunnel(name, tunnelSecret)
@@ -168,15 +155,16 @@ func (sc *subcommandContext) create(name string, credentialsFilePath string) (*t
 	if err != nil {
 		return nil, err
 	}
+
 	tunnelCredentials := connection.Credentials{
-		AccountTag:   credential.cert.AccountID,
+		AccountTag:   credential.AccountID(),
 		TunnelSecret: tunnelSecret,
 		TunnelID:     tunnel.ID,
-		TunnelName:   name,
+		Endpoint:     credential.Endpoint(),
 	}
 	usedCertPath := false
 	if credentialsFilePath == "" {
-		originCertDir := filepath.Dir(credential.certPath)
+		originCertDir := filepath.Dir(credential.CertPath())
 		credentialsFilePath, err = tunnelFilePath(tunnelCredentials.TunnelID, originCertDir)
 		if err != nil {
 			return nil, err
@@ -188,11 +176,11 @@ func (sc *subcommandContext) create(name string, credentialsFilePath string) (*t
 		var errorLines []string
 		errorLines = append(errorLines, fmt.Sprintf("Your tunnel '%v' was created with ID %v. However, cloudflared couldn't write tunnel credentials to %s.", tunnel.Name, tunnel.ID, credentialsFilePath))
 		errorLines = append(errorLines, fmt.Sprintf("The file-writing error is: %v", writeFileErr))
-		if deleteErr := client.DeleteTunnel(tunnel.ID); deleteErr != nil {
+		if deleteErr := client.DeleteTunnel(tunnel.ID, true); deleteErr != nil {
 			errorLines = append(errorLines, fmt.Sprintf("Cloudflared tried to delete the tunnel for you, but encountered an error. You should use `cloudflared tunnel delete %v` to delete the tunnel yourself, because the tunnel can't be run without the tunnelfile.", tunnel.ID))
 			errorLines = append(errorLines, fmt.Sprintf("The delete tunnel error is: %v", deleteErr))
 		} else {
-			errorLines = append(errorLines, fmt.Sprintf("The tunnel was deleted, because the tunnel can't be run without the credentials file"))
+			errorLines = append(errorLines, "The tunnel was deleted, because the tunnel can't be run without the credentials file")
 		}
 		errorMsg := strings.Join(errorLines, "\n")
 		return nil, errors.New(errorMsg)
@@ -208,10 +196,11 @@ func (sc *subcommandContext) create(name string, credentialsFilePath string) (*t
 	}
 	fmt.Println(" Keep this file secret. To revoke these credentials, delete the tunnel.")
 	fmt.Printf("\nCreated tunnel %s with id %s\n", tunnel.Name, tunnel.ID)
-	return tunnel, nil
+
+	return &tunnel.Tunnel, nil
 }
 
-func (sc *subcommandContext) list(filter *tunnelstore.Filter) ([]*tunnelstore.Tunnel, error) {
+func (sc *subcommandContext) list(filter *cfapi.TunnelFilter) ([]*cfapi.Tunnel, error) {
 	client, err := sc.client()
 	if err != nil {
 		return nil, err
@@ -220,7 +209,7 @@ func (sc *subcommandContext) list(filter *tunnelstore.Filter) ([]*tunnelstore.Tu
 }
 
 func (sc *subcommandContext) delete(tunnelIDs []uuid.UUID) error {
-	forceFlagSet := sc.c.Bool("force")
+	forceFlagSet := sc.c.Bool(cfdflags.Force)
 
 	client, err := sc.client()
 	if err != nil {
@@ -230,20 +219,15 @@ func (sc *subcommandContext) delete(tunnelIDs []uuid.UUID) error {
 	for _, id := range tunnelIDs {
 		tunnel, err := client.GetTunnel(id)
 		if err != nil {
-			return errors.Wrapf(err, "Can't get tunnel information. Please check tunnel id: %s", tunnel.ID)
+			return errors.Wrapf(err, "Can't get tunnel information. Please check tunnel id: %s", id)
 		}
 
 		// Check if tunnel DeletedAt field has already been set
 		if !tunnel.DeletedAt.IsZero() {
 			return fmt.Errorf("Tunnel %s has already been deleted", tunnel.ID)
 		}
-		if forceFlagSet {
-			if err := client.CleanupConnections(tunnel.ID, tunnelstore.NewCleanupParams()); err != nil {
-				return errors.Wrapf(err, "Error cleaning up connections for tunnel %s", tunnel.ID)
-			}
-		}
 
-		if err := client.DeleteTunnel(tunnel.ID); err != nil {
+		if err := client.DeleteTunnel(tunnel.ID, forceFlagSet); err != nil {
 			return errors.Wrapf(err, "Error deleting tunnel %s", tunnel.ID)
 		}
 
@@ -261,8 +245,16 @@ func (sc *subcommandContext) delete(tunnelIDs []uuid.UUID) error {
 // and add the TunnelID into any old credentials (generated before TUN-3581 added the `TunnelID`
 // field to credentials files)
 func (sc *subcommandContext) findCredentials(tunnelID uuid.UUID) (connection.Credentials, error) {
-	credFinder := sc.credentialFinder(tunnelID)
-	credentials, err := sc.readTunnelCredentials(credFinder)
+	var credentials connection.Credentials
+	var err error
+	if credentialsContents := sc.c.String(CredContentsFlag); credentialsContents != "" {
+		if err = json.Unmarshal([]byte(credentialsContents), &credentials); err != nil {
+			err = invalidJSONCredentialError{path: "TUNNEL_CRED_CONTENTS", err: err}
+		}
+	} else {
+		credFinder := sc.credentialFinder(tunnelID)
+		credentials, err = sc.readTunnelCredentials(credFinder)
+	}
 	// This line ensures backwards compatibility with credentials files generated before
 	// TUN-3581. Those old credentials files don't have a TunnelID field, so we enrich the struct
 	// with the ID, which we have already resolved from the user input.
@@ -273,24 +265,29 @@ func (sc *subcommandContext) findCredentials(tunnelID uuid.UUID) (connection.Cre
 func (sc *subcommandContext) run(tunnelID uuid.UUID) error {
 	credentials, err := sc.findCredentials(tunnelID)
 	if err != nil {
-		if e, ok := err.(errInvalidJSONCredential); ok {
+		if e, ok := err.(invalidJSONCredentialError); ok {
 			sc.log.Error().Msgf("The credentials file at %s contained invalid JSON. This is probably caused by passing the wrong filepath. Reminder: the credentials file is a .json file created via `cloudflared tunnel create`.", e.path)
 			sc.log.Error().Msgf("Invalid JSON when parsing credentials file: %s", e.err.Error())
 		}
 		return err
 	}
 
+	return sc.runWithCredentials(credentials)
+}
+
+func (sc *subcommandContext) runWithCredentials(credentials connection.Credentials) error {
+	sc.log.Info().Str(LogFieldTunnelID, credentials.TunnelID.String()).Msg("Starting tunnel")
+
 	return StartServer(
 		sc.c,
-		version,
-		&connection.NamedTunnelConfig{Credentials: credentials},
+		buildInfo,
+		&connection.TunnelProperties{Credentials: credentials},
 		sc.log,
-		sc.isUIEnabled,
 	)
 }
 
 func (sc *subcommandContext) cleanupConnections(tunnelIDs []uuid.UUID) error {
-	params := tunnelstore.NewCleanupParams()
+	params := cfapi.NewCleanupParams()
 	extraLog := ""
 	if connector := sc.c.String("connector-id"); connector != "" {
 		connectorID, err := uuid.Parse(connector)
@@ -314,7 +311,22 @@ func (sc *subcommandContext) cleanupConnections(tunnelIDs []uuid.UUID) error {
 	return nil
 }
 
-func (sc *subcommandContext) route(tunnelID uuid.UUID, r tunnelstore.Route) (tunnelstore.RouteResult, error) {
+func (sc *subcommandContext) getTunnelTokenCredentials(tunnelID uuid.UUID) (*connection.TunnelToken, error) {
+	client, err := sc.client()
+	if err != nil {
+		return nil, err
+	}
+
+	token, err := client.GetTunnelToken(tunnelID)
+	if err != nil {
+		sc.log.Err(err).Msgf("Could not get the Token for the given Tunnel %v", tunnelID)
+		return nil, err
+	}
+
+	return ParseToken(token)
+}
+
+func (sc *subcommandContext) route(tunnelID uuid.UUID, r cfapi.HostnameRoute) (cfapi.HostnameRouteResult, error) {
 	client, err := sc.client()
 	if err != nil {
 		return nil, err
@@ -324,8 +336,8 @@ func (sc *subcommandContext) route(tunnelID uuid.UUID, r tunnelstore.Route) (tun
 }
 
 // Query Tunnelstore to find the active tunnel with the given name.
-func (sc *subcommandContext) tunnelActive(name string) (*tunnelstore.Tunnel, bool, error) {
-	filter := tunnelstore.NewFilter()
+func (sc *subcommandContext) tunnelActive(name string) (*cfapi.Tunnel, bool, error) {
+	filter := cfapi.NewTunnelFilter()
 	filter.NoDeleted()
 	filter.ByName(name)
 	tunnels, err := sc.list(filter)
@@ -349,7 +361,7 @@ func (sc *subcommandContext) findID(input string) (uuid.UUID, error) {
 	// Look up name in the credentials file.
 	credFinder := newStaticPath(sc.c.String(CredFileFlag), sc.fs)
 	if credentials, err := sc.readTunnelCredentials(credFinder); err == nil {
-		if credentials.TunnelID != uuid.Nil && input == credentials.TunnelName {
+		if credentials.TunnelID != uuid.Nil {
 			return credentials.TunnelID, nil
 		}
 	}
@@ -365,52 +377,42 @@ func (sc *subcommandContext) findID(input string) (uuid.UUID, error) {
 }
 
 // findIDs is just like mapping `findID` over a slice, but it only uses
-// one Tunnelstore API call.
+// one Tunnelstore API call per non-UUID input provided.
 func (sc *subcommandContext) findIDs(inputs []string) ([]uuid.UUID, error) {
+	uuids, names := splitUuids(inputs)
 
-	// Shortcut without Tunnelstore call if we find that all inputs are already UUIDs.
-	uuids, err := convertNamesToUuids(inputs, make(map[string]uuid.UUID))
-	if err == nil {
-		return uuids, nil
+	for _, name := range names {
+		filter := cfapi.NewTunnelFilter()
+		filter.NoDeleted()
+		filter.ByName(name)
+
+		tunnels, err := sc.list(filter)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(tunnels) != 1 {
+			return nil, fmt.Errorf("there should only be 1 non-deleted Tunnel named %s", name)
+		}
+
+		uuids = append(uuids, tunnels[0].ID)
 	}
 
-	// First, look up all tunnels the user has
-	filter := tunnelstore.NewFilter()
-	filter.NoDeleted()
-	tunnels, err := sc.list(filter)
-	if err != nil {
-		return nil, err
-	}
-	// Do the pure list-processing in its own function, so that it can be
-	// unit tested easily.
-	return findIDs(tunnels, inputs)
+	return uuids, nil
 }
 
-func findIDs(tunnels []*tunnelstore.Tunnel, inputs []string) ([]uuid.UUID, error) {
-	// Put them into a dictionary for faster lookups
-	nameToID := make(map[string]uuid.UUID, len(tunnels))
-	for _, tunnel := range tunnels {
-		nameToID[tunnel.Name] = tunnel.ID
-	}
+func splitUuids(inputs []string) ([]uuid.UUID, []string) {
+	uuids := make([]uuid.UUID, 0)
+	names := make([]string, 0)
 
-	return convertNamesToUuids(inputs, nameToID)
-}
-
-func convertNamesToUuids(inputs []string, nameToID map[string]uuid.UUID) ([]uuid.UUID, error) {
-	tunnelIDs := make([]uuid.UUID, len(inputs))
-	var badInputs []string
-	for i, input := range inputs {
-		if id, err := uuid.Parse(input); err == nil {
-			tunnelIDs[i] = id
-		} else if id, ok := nameToID[input]; ok {
-			tunnelIDs[i] = id
+	for _, input := range inputs {
+		id, err := uuid.Parse(input)
+		if err != nil {
+			names = append(names, input)
 		} else {
-			badInputs = append(badInputs, input)
+			uuids = append(uuids, id)
 		}
 	}
-	if len(badInputs) > 0 {
-		msg := "Please specify either the ID or name of a tunnel. The following inputs were neither: %s"
-		return nil, fmt.Errorf(msg, strings.Join(badInputs, ", "))
-	}
-	return tunnelIDs, nil
+
+	return uuids, names
 }

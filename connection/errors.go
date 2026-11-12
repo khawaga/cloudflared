@@ -1,8 +1,9 @@
 package connection
 
 import (
-	"github.com/cloudflare/cloudflared/edgediscovery"
-	"github.com/cloudflare/cloudflared/h2mux"
+	"errors"
+	"fmt"
+
 	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 )
 
@@ -10,12 +11,19 @@ const (
 	DuplicateConnectionError = "EDUPCONN"
 )
 
-type DupConnRegisterTunnelError struct{}
+var ErrDuplicateConnection = errors.New("already connected to this server, trying another address")
 
-var errDuplicationConnection = DupConnRegisterTunnelError{}
+// Dial to edge server with quic failed
+type EdgeQuicDialError struct {
+	Cause error
+}
 
-func (e DupConnRegisterTunnelError) Error() string {
-	return "already connected to this server, trying another address"
+func (e *EdgeQuicDialError) Error() string {
+	return "failed to dial to edge with quic: " + e.Cause.Error()
+}
+
+func (e *EdgeQuicDialError) Unwrap() error {
+	return e.Cause
 }
 
 // RegisterTunnel error from server
@@ -26,6 +34,10 @@ type ServerRegisterTunnelError struct {
 
 func (e ServerRegisterTunnelError) Error() string {
 	return e.Cause.Error()
+}
+
+func (e ServerRegisterTunnelError) Unwrap() error {
+	return e.Cause
 }
 
 func serverRegistrationErrorFromRPC(err error) ServerRegisterTunnelError {
@@ -41,28 +53,44 @@ func serverRegistrationErrorFromRPC(err error) ServerRegisterTunnelError {
 	}
 }
 
-type muxerShutdownError struct{}
-
-func (e muxerShutdownError) Error() string {
-	return "muxer shutdown"
+type ControlStreamError struct {
+	Cause error
 }
 
-var errMuxerStopped = muxerShutdownError{}
+var _ error = &ControlStreamError{}
 
-func isHandshakeErrRecoverable(err error, connIndex uint8, observer *Observer) bool {
-	log := observer.log.With().
-		Uint8(LogFieldConnIndex, connIndex).
-		Err(err).
-		Logger()
+func (e *ControlStreamError) Error() string {
+	return fmt.Sprintf("control stream error: %s", e.Cause)
+}
 
-	switch err.(type) {
-	case edgediscovery.DialError:
-		log.Error().Msg("Connection unable to dial edge")
-	case h2mux.MuxerHandshakeError:
-		log.Error().Msg("Connection handshake with edge server failed")
-	default:
-		log.Error().Msg("Connection failed")
-		return false
-	}
-	return true
+func (e *ControlStreamError) Unwrap() error {
+	return e.Cause
+}
+
+type StreamListenerError struct {
+	Cause error
+}
+
+var _ error = &StreamListenerError{}
+
+func (e *StreamListenerError) Error() string {
+	return fmt.Sprintf("accept stream listener error: %s", e.Cause)
+}
+
+func (e *StreamListenerError) Unwrap() error {
+	return e.Cause
+}
+
+type DatagramManagerError struct {
+	Cause error
+}
+
+var _ error = &DatagramManagerError{}
+
+func (e *DatagramManagerError) Error() string {
+	return fmt.Sprintf("datagram manager error: %s", e.Cause)
+}
+
+func (e *DatagramManagerError) Unwrap() error {
+	return e.Cause
 }

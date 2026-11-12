@@ -1,53 +1,61 @@
 package token
 
 import (
-	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
+	"slices"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/coreos/go-oidc/jose"
+	"github.com/go-jose/go-jose/v4"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
-
-	"github.com/cloudflare/cloudflared/config"
-	"github.com/cloudflare/cloudflared/retry"
+	"github.com/shirou/gopsutil/v4/process"
 )
 
 const (
-	keyName               = "token"
-	tokenCookie           = "CF_Authorization"
-	appDomainHeader       = "CF-Access-Domain"
-	appAUDHeader          = "CF-Access-Aud"
-	AccessLoginWorkerPath = "/cdn-cgi/access/login"
+	keyName                    = "token"
+	tokenCookie                = "CF_Authorization"
+	appSessionCookie           = "CF_AppSession"
+	accessMetadataReqHeader    = "cf-access-metadata-request"
+	accessMetadataReqValue     = "true"
+	accessMetadataRespHeader   = "cf-access-metadata"
+	userAgentHeader            = "User-Agent"
+	AccessLoginWorkerPath      = "/cdn-cgi/access/login"
+	AccessAuthorizedWorkerPath = "/cdn-cgi/access/authorized"
+	metadataMatchType          = "match"
+	metadataMaxAge             = 24 * time.Hour
+	metadataAllowedClockSkew   = 5 * time.Minute
 )
 
+var userAgent = "DEV"
+
 type AppInfo struct {
-	AuthDomain string
-	AppAUD     string
-	AppDomain  string
+	AuthDomain  string
+	AppAUD      string
+	AppHostname string
 }
 
-type lock struct {
-	lockFilePath string
-	backoff      *retry.BackoffHandler
-	sigHandler   *signalHandler
+// lockContent is the JSON structure written into lock files.
+type lockContent struct {
+	PID       int32  `json:"pid"`
+	StartTime int64  `json:"start_time"`
+	ID        string `json:"id,omitempty"`
 }
 
-type signalHandler struct {
-	sigChannel chan os.Signal
-	signals    []os.Signal
+type lockFile struct {
+	path    string
+	content lockContent
+	log     *zerolog.Logger
 }
 
 type jwtPayload struct {
-	Aud   []string `json:"aud"`
+	Aud   []string `json:"-"`
 	Email string   `json:"email"`
 	Exp   int      `json:"exp"`
 	Iat   int      `json:"iat"`
@@ -62,163 +70,337 @@ type transferServiceResponse struct {
 	OrgToken string `json:"org_token"`
 }
 
+func (p *jwtPayload) UnmarshalJSON(data []byte) error {
+	type Alias jwtPayload
+	if err := json.Unmarshal(data, (*Alias)(p)); err != nil {
+		return err
+	}
+	var audParser struct {
+		Aud any `json:"aud"`
+	}
+	if err := json.Unmarshal(data, &audParser); err != nil {
+		return err
+	}
+	switch aud := audParser.Aud.(type) {
+	case string:
+		p.Aud = []string{aud}
+	case []any:
+		for _, a := range aud {
+			s, ok := a.(string)
+			if !ok {
+				return errors.New("aud array contains non-string elements")
+			}
+			p.Aud = append(p.Aud, s)
+		}
+	default:
+		return errors.New("aud field is not a string or an array of strings")
+	}
+	return nil
+}
+
 func (p jwtPayload) isExpired() bool {
 	return int(time.Now().Unix()) > p.Exp
 }
 
-func (s *signalHandler) register(handler func()) {
-	s.sigChannel = make(chan os.Signal, 1)
-	signal.Notify(s.sigChannel, s.signals...)
-	go func(s *signalHandler) {
-		for range s.sigChannel {
-			handler()
+const (
+	lockRetryInterval  = 2 * time.Second
+	lockTimeout        = 10 * time.Minute
+	startTimeTolerance = int64(1000) // milliseconds
+)
+
+// acquireLockFile loops until it successfully creates a lock file for the
+// given token file path. The lock file is created at tokenPath + ".lock".
+//
+// On each iteration:
+//  1. Try to create the file atomically with O_CREATE|O_EXCL.
+//     If that succeeds, write our PID + start time and return the lock.
+//  2. If the file already exists, read it and check whether the owning
+//     process is still alive (PID exists and start time matches).
+//  3. If the owner is alive, sleep for lockRetryInterval and retry.
+//  4. If the owner is dead (stale lock), remove the file and immediately
+//     retry the O_EXCL create. No sleep (the atomic create is the
+//     tiebreaker if multiple processes race to reclaim).
+func acquireLockFile(tokenPath string, log *zerolog.Logger) (*lockFile, error) {
+	lockPath := tokenPath + ".lock"
+	deadline := time.Now().Add(lockTimeout)
+	lastURL := ""
+	for {
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for lock file %s", lockPath)
 		}
-	}(s)
-}
+		content, err := createLockFile(lockPath)
+		if err == nil {
+			log.Debug().Str("path", lockPath).Msg("lock file acquired")
+			return &lockFile{path: lockPath, content: content, log: log}, nil
+		}
+		if !os.IsExist(err) {
+			return nil, errors.Wrapf(err, "failed to create lock file %s", lockPath)
+		}
 
-func (s *signalHandler) deregister() {
-	signal.Stop(s.sigChannel)
-	close(s.sigChannel)
-}
-
-func errDeleteTokenFailed(lockFilePath string) error {
-	return fmt.Errorf("failed to acquire a new Access token. Please try to delete %s", lockFilePath)
-}
-
-// newLock will get a new file lock
-func newLock(path string) *lock {
-	lockPath := path + ".lock"
-	return &lock{
-		lockFilePath: lockPath,
-		backoff:      &retry.BackoffHandler{MaxRetries: 7},
-		sigHandler: &signalHandler{
-			signals: []os.Signal{syscall.SIGINT, syscall.SIGTERM},
-		},
-	}
-}
-
-func (l *lock) Acquire() error {
-	// Intercept SIGINT and SIGTERM to release lock before exiting
-	l.sigHandler.register(func() {
-		_ = l.deleteLockFile()
-		os.Exit(0)
-	})
-
-	// Check for a lock file
-	// if the lock file exists; start polling
-	// if not, create the lock file and go through the normal flow.
-	// See AUTH-1736 for the reason why we do all this
-	for isTokenLocked(l.lockFilePath) {
-		if l.backoff.Backoff(context.Background()) {
+		// lock file exists, so check if the owner is still alive
+		stale, content, checkErr := isLockFileStale(lockPath)
+		if checkErr != nil {
+			// file may be mid-write by another racer, or was removed
+			// between our O_EXCL attempt and this read
+			log.Debug().Err(checkErr).Str("path", lockPath).
+				Msg("could not read lock file, retrying")
+			time.Sleep(lockRetryInterval)
 			continue
 		}
 
-		if err := l.deleteLockFile(); err != nil {
-			return err
+		if !stale {
+			// try to display the auth URL so the user can open a browser
+			// manually if the original window is not visible
+			if authURL := readAuthURL(tokenPath); authURL != "" && authURL != lastURL {
+				fmt.Fprintf(os.Stderr, "\nAnother cloudflared process (pid %d) "+
+					"is already waiting for authentication.\n\n"+
+					"If a browser window did not open, please visit "+
+					"the following URL:\n\n%s\n\n", content.PID, authURL)
+				lastURL = authURL
+			}
+			log.Debug().Str("path", lockPath).
+				Msg("lock file is held by another process, retrying")
+			time.Sleep(lockRetryInterval)
+			continue
+		}
+
+		// stale, so remove and immediately retry
+		log.Debug().Str("path", lockPath).Int32("stale_pid", content.PID).
+			Msg("reclaiming stale lock file")
+		if removeErr := os.Remove(lockPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Debug().Err(removeErr).Str("path", lockPath).
+				Msg("could not remove stale lock file, retrying")
+			time.Sleep(lockRetryInterval)
+			continue
 		}
 	}
+}
 
-	// Create a lock file so other processes won't also try to get the token at
-	// the same time
-	if err := ioutil.WriteFile(l.lockFilePath, []byte{}, 0600); err != nil {
-		return err
+func (l *lockFile) release() {
+	if l == nil {
+		return
 	}
-	return nil
-}
 
-func (l *lock) deleteLockFile() error {
-	if err := os.Remove(l.lockFilePath); err != nil && !os.IsNotExist(err) {
-		return errDeleteTokenFailed(l.lockFilePath)
+	data, err := os.ReadFile(l.path) // nolint: gosec
+	if err != nil {
+		if !os.IsNotExist(err) {
+			l.log.Debug().Err(err).Str("path", l.path).Msg("could not read lock file during release")
+		}
+		return
 	}
-	return nil
+
+	var content lockContent
+	if err := json.Unmarshal(data, &content); err != nil {
+		l.log.Debug().Err(err).Str("path", l.path).Msg("could not parse lock file during release")
+		return
+	}
+
+	if content.ID == "" ||
+		content.ID != l.content.ID ||
+		content.PID != l.content.PID ||
+		content.StartTime != l.content.StartTime {
+		return
+	}
+
+	if err := os.Remove(l.path); err != nil && !os.IsNotExist(err) {
+		l.log.Debug().Err(err).Str("path", l.path).Msg("could not remove lock file during release")
+	}
 }
 
-func (l *lock) Release() error {
-	defer l.sigHandler.deregister()
-	return l.deleteLockFile()
+// readAuthURL reads the auth URL companion file for the given token path.
+// Returns the URL string, or empty string if the file doesn't exist or
+// can't be read.
+func readAuthURL(tokenPath string) string {
+	data, err := os.ReadFile(tokenPath + ".url") // nolint: gosec
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
-// isTokenLocked checks to see if there is another process attempting to get the token already
-func isTokenLocked(lockFilePath string) bool {
-	exists, err := config.FileExists(lockFilePath)
-	return exists && err == nil
+func createLockFile(path string) (content lockContent, retErr error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600) // nolint: gosec
+	if err != nil {
+		return lockContent{}, err
+	}
+	defer func() {
+		if retErr != nil {
+			_ = f.Close()
+			_ = os.Remove(path)
+			return
+		}
+		retErr = f.Close()
+	}()
+
+	content, err = newSelfLockContent()
+	if err != nil {
+		return lockContent{}, err
+	}
+
+	if err := json.NewEncoder(f).Encode(content); err != nil {
+		return lockContent{}, err
+	}
+
+	return content, nil
+}
+
+// newSelfLockContent returns a lockContent describing the current process.
+func newSelfLockContent() (lockContent, error) {
+	pid := int32(os.Getpid()) // nolint: gosec
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		return lockContent{}, fmt.Errorf("failed to look up own process: %w", err)
+	}
+	ct, err := p.CreateTime()
+	if err != nil {
+		return lockContent{}, fmt.Errorf("failed to get own start time: %w", err)
+	}
+	id, err := newLockID()
+	if err != nil {
+		return lockContent{}, err
+	}
+	return lockContent{PID: pid, StartTime: ct, ID: id}, nil
+}
+
+func newLockID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("failed to generate lock ID: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// isLockFileStale reads the lock file and checks whether the owning process
+// is dead or has a mismatched start time. Returns (true, content, nil) if
+// stale, (false, content, nil) if actively held, or an error if the file
+// cannot be read.
+func isLockFileStale(path string) (bool, lockContent, error) {
+	data, err := os.ReadFile(path) // nolint: gosec
+	if err != nil {
+		return false, lockContent{}, err
+	}
+	var content lockContent
+	if err := json.Unmarshal(data, &content); err != nil {
+		// corrupt or empty file (treat as stale)
+		return true, lockContent{}, nil
+	}
+
+	p, err := process.NewProcess(content.PID)
+	if err != nil {
+		return true, content, nil // process does not exist
+	}
+	// CreateTime reads /proc/{pid}/stat on Linux (world-readable, always works).
+	// On Windows and macOS it can fail for processes owned by a different user,
+	// but cloudflared instances sharing a lock file are always running as the
+	// same user (the lock directory is derived from ~ via go-homedir).
+	ct, err := p.CreateTime()
+	if err != nil {
+		return true, content, nil // cannot query process (treat as stale)
+	}
+
+	diff := ct - content.StartTime
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > startTimeTolerance {
+		return true, content, nil // PID was recycled (different process)
+	}
+
+	// If the lock file is older than lockTimeout, the auth flow is
+	// definitely complete and the process is no longer doing auth work.
+	info, err := os.Stat(path)
+	if err == nil && time.Since(info.ModTime()) > lockTimeout {
+		return true, content, nil
+	}
+
+	return false, content, nil // process is alive and actively authenticating
+}
+
+func Init(version string) {
+	userAgent = fmt.Sprintf("cloudflared/%s", version)
 }
 
 // FetchTokenWithRedirect will either load a stored token or generate a new one
-// it appends the full url as the redirect URL to the access cli request if opening the browser
-func FetchTokenWithRedirect(appURL *url.URL, appInfo *AppInfo, log *zerolog.Logger) (string, error) {
-	return getToken(appURL, appInfo, false, log)
+// it appends the full url as the redirect URL to the access cli request if opening the browser.
+// The FedRAMP token transfer relay is used when forceFedramp is set or appInfo.AuthDomain is a FedRAMP auth domain.
+func FetchTokenWithRedirect(appURL *url.URL, appInfo *AppInfo, autoClose bool, forceFedramp bool, log *zerolog.Logger) (string, error) {
+	return getToken(appURL, appInfo, false, autoClose, forceFedramp, log)
 }
 
 // FetchToken will either load a stored token or generate a new one
-// it appends the host of the appURL as the redirect URL to the access cli request if opening the browser
-func FetchToken(appURL *url.URL, appInfo *AppInfo, log *zerolog.Logger) (string, error) {
-	return getToken(appURL, appInfo, true, log)
+// it appends the host of the appURL as the redirect URL to the access cli request if opening the browser.
+// The FedRAMP token transfer relay is used when forceFedramp is set or appInfo.AuthDomain is a FedRAMP auth domain.
+func FetchToken(appURL *url.URL, appInfo *AppInfo, autoClose bool, forceFedramp bool, log *zerolog.Logger) (string, error) {
+	return getToken(appURL, appInfo, true, autoClose, forceFedramp, log)
 }
 
 // getToken will either load a stored token or generate a new one
-func getToken(appURL *url.URL, appInfo *AppInfo, useHostOnly bool, log *zerolog.Logger) (string, error) {
+func getToken(appURL *url.URL, appInfo *AppInfo, useHostOnly bool, autoClose bool, forceFedramp bool, log *zerolog.Logger) (string, error) {
 	if token, err := GetAppTokenIfExists(appInfo); token != "" && err == nil {
 		return token, nil
 	}
 
-	appTokenPath, err := GenerateAppTokenFilePathFromURL(appInfo.AppDomain, appInfo.AppAUD, keyName)
+	appTokenPath, err := GenerateAppTokenFilePathFromURL(appInfo.AppHostname, appInfo.AppAUD, keyName)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to generate app token file path")
 	}
 
-	fileLockAppToken := newLock(appTokenPath)
-	if err = fileLockAppToken.Acquire(); err != nil {
+	appTokenLock, err := acquireLockFile(appTokenPath, log)
+	if err != nil {
 		return "", errors.Wrap(err, "failed to acquire app token lock")
 	}
-	defer fileLockAppToken.Release()
+	defer appTokenLock.release()
 
 	// check to see if another process has gotten a token while we waited for the lock
 	if token, err := GetAppTokenIfExists(appInfo); token != "" && err == nil {
 		return token, nil
 	}
 
-	// If an app token couldnt be found on disk, check for an org token and attempt to exchange it for an app token.
+	// If an app token couldn't be found on disk, check for an org token and attempt to exchange it for an app token.
 	var orgTokenPath string
-	orgToken, err := GetOrgTokenIfExists(appInfo.AuthDomain)
-	if err != nil {
+	orgToken, orgTokenErr := GetOrgTokenIfExists(appInfo.AuthDomain)
+	if orgTokenErr != nil {
 		orgTokenPath, err = generateOrgTokenFilePathFromURL(appInfo.AuthDomain)
 		if err != nil {
 			return "", errors.Wrap(err, "failed to generate org token file path")
 		}
 
-		fileLockOrgToken := newLock(orgTokenPath)
-		if err = fileLockOrgToken.Acquire(); err != nil {
-			return "", errors.Wrap(err, "failed to acquire org token lock")
+		orgTokenLock, orgLockErr := acquireLockFile(orgTokenPath, log)
+		if orgLockErr != nil {
+			return "", errors.Wrap(orgLockErr, "failed to acquire org token lock")
 		}
-		defer fileLockOrgToken.Release()
+		defer orgTokenLock.release()
 		// check if an org token has been created since the lock was acquired
-		orgToken, err = GetOrgTokenIfExists(appInfo.AuthDomain)
+		orgToken, orgTokenErr = GetOrgTokenIfExists(appInfo.AuthDomain)
 	}
-	if err == nil {
-		if appToken, err := exchangeOrgToken(appURL, orgToken); err != nil {
-			log.Debug().Msgf("failed to exchange org token for app token: %s", err)
+	if orgTokenErr == nil {
+		if appToken, exchangeErr := exchangeOrgToken(appURL, orgToken); exchangeErr != nil {
+			log.Debug().Msgf("failed to exchange org token for app token: %s", exchangeErr)
 		} else {
 			// generate app path
-			if err := ioutil.WriteFile(appTokenPath, []byte(appToken), 0600); err != nil {
+			if err := os.WriteFile(appTokenPath, []byte(appToken), 0600); err != nil { // nolint: gosec
 				return "", errors.Wrap(err, "failed to write app token to disk")
 			}
 			return appToken, nil
 		}
 	}
-	return getTokensFromEdge(appURL, appTokenPath, orgTokenPath, useHostOnly, log)
-
+	isFedramp := forceFedramp
+	if !isFedramp && isFedAuthDomain(appInfo.AuthDomain) {
+		log.Debug().Msg("Detected FedRAMP Access auth domain; using FedRAMP token transfer relay")
+		isFedramp = true
+	}
+	return getTokensFromEdge(appURL, appInfo.AppAUD, appTokenPath, orgTokenPath, useHostOnly, autoClose, isFedramp, log)
 }
 
 // getTokensFromEdge will attempt to use the transfer service to retrieve an app and org token, save them to disk,
 // and return the app token.
-func getTokensFromEdge(appURL *url.URL, appTokenPath, orgTokenPath string, useHostOnly bool, log *zerolog.Logger) (string, error) {
-	// If no org token exists or if it couldnt be exchanged for an app token, then run the transfer service flow.
+func getTokensFromEdge(appURL *url.URL, appAUD, appTokenPath, orgTokenPath string, useHostOnly bool, autoClose bool, isFedramp bool, log *zerolog.Logger) (string, error) {
+	// If no org token exists or if it couldn't be exchanged for an app token, then run the transfer service flow.
 
 	// this weird parameter is the resource name (token) and the key/value
 	// we want to send to the transfer service. the key is token and the value
 	// is blank (basically just the id generated in the transfer service)
-	resourceData, err := RunTransfer(appURL, keyName, keyName, "", true, useHostOnly, log)
+	resourceData, err := RunTransfer(appURL, appAUD, keyName, keyName, "", true, useHostOnly, autoClose, isFedramp, log, appTokenPath+".url")
 	if err != nil {
 		return "", errors.Wrap(err, "failed to run transfer service")
 	}
@@ -229,64 +411,146 @@ func getTokensFromEdge(appURL *url.URL, appTokenPath, orgTokenPath string, useHo
 
 	// If we were able to get the auth domain and generate an org token path, lets write it to disk.
 	if orgTokenPath != "" {
-		if err := ioutil.WriteFile(orgTokenPath, []byte(resp.OrgToken), 0600); err != nil {
+		if err := os.WriteFile(orgTokenPath, []byte(resp.OrgToken), 0600); err != nil {
 			return "", errors.Wrap(err, "failed to write org token to disk")
 		}
 	}
 
-	if err := ioutil.WriteFile(appTokenPath, []byte(resp.AppToken), 0600); err != nil {
+	if err := os.WriteFile(appTokenPath, []byte(resp.AppToken), 0600); err != nil {
 		return "", errors.Wrap(err, "failed to write app token to disk")
 	}
 
 	return resp.AppToken, nil
-
 }
 
-// GetAppInfo makes a request to the appURL and stops at the first redirect. The 302 location header will contain the
-// auth domain
+// GetAppInfo discovers the Access application protecting reqURL by requesting
+// a signed metadata JWT from the Cloudflare edge. The JWT signature is verified
+// against the account's public keys (fetched from the auth domain's JWKS
+// endpoint) to prevent an attacker-controlled server from spoofing app identity.
 func GetAppInfo(reqURL *url.URL) (*AppInfo, error) {
+	// Fetch the metadata JWT from the edge (no redirects followed).
+	rawJWT, err := fetchMetadataJWT(reqURL.String())
+	if err != nil {
+		return nil, err
+	}
+
+	// Decode without verification to extract auth_domain for JWKS lookup.
+	unverified, err := decodeMetadataUnverified(rawJWT)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse auth_domain into the canonical hostname used for JWKS lookup.
+	authDomain, err := parseAuthDomain(unverified.AuthDomain)
+	if err != nil {
+		return nil, fmt.Errorf("metadata JWT auth_domain validation failed: %w", err)
+	}
+
+	// Verify the JWT signature against the JWKS (with disk cache + retry).
+	claims, err := verifyMetadataWithRetry(rawJWT, authDomain)
+	if err != nil {
+		return nil, fmt.Errorf("metadata JWT verification failed: %w", err)
+	}
+
+	// Verify the hostname in the JWT matches the URL we actually requested.
+	if !strings.EqualFold(claims.Hostname, reqURL.Hostname()) {
+		return nil, fmt.Errorf("metadata JWT hostname %q does not match request host %q", claims.Hostname, reqURL.Hostname())
+	}
+	if claims.Type != metadataMatchType {
+		return nil, fmt.Errorf("metadata JWT type %q is not match", claims.Type)
+	}
+	if claims.AUD == "" {
+		return nil, errors.New("metadata JWT aud is empty")
+	}
+	if err := validateMetadataIssuedAt(claims.IAT, time.Now()); err != nil {
+		return nil, err
+	}
+
+	appHostname := claims.AppHostname
+	if appHostname == "" {
+		// For retro-compatibility with CF access older releases, this will cause wildcard apps to store one local token
+		// per requested hostname, which is less optimized but also works.
+		appHostname = claims.Hostname
+	}
+
+	return &AppInfo{
+		AuthDomain:  authDomain.Hostname(),
+		AppAUD:      claims.AUD,
+		AppHostname: appHostname,
+	}, nil
+}
+
+// fetchMetadataJWT sends a HEAD request to reqURL with the metadata request
+// header and returns the raw JWT string from the response. No redirects are
+// followed.
+func fetchMetadataJWT(reqURL string) (string, error) {
 	client := &http.Client{
-		// do not follow redirects
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// stop after hitting login endpoint since it will contain app path
-			if strings.Contains(via[len(via)-1].URL.Path, AccessLoginWorkerPath) {
-				return http.ErrUseLastResponse
-			}
-			return nil
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
 		},
 		Timeout: time.Second * 7,
 	}
 
-	appInfoReq, err := http.NewRequest("HEAD", reqURL.String(), nil)
+	req, err := http.NewRequest("HEAD", reqURL, nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create app info request")
+		return "", errors.Wrap(err, "failed to create app info request")
 	}
-	resp, err := client.Do(appInfoReq)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get app info")
-	}
-	resp.Body.Close()
+	req.Header.Set(accessMetadataReqHeader, accessMetadataReqValue)
+	req.Header.Set(userAgentHeader, userAgent)
 
-	var aud string
-	location := resp.Request.URL
-	if strings.Contains(location.Path, AccessLoginWorkerPath) {
-		aud = resp.Request.URL.Query().Get("kid")
-		if aud == "" {
-			return nil, errors.New("Empty app aud")
+	resp, err := client.Do(req) // nolint: gosec
+	if err != nil {
+		return "", errors.Wrap(err, "failed to get app info")
+	}
+	_ = resp.Body.Close()
+
+	rawJWT := resp.Header.Get(accessMetadataRespHeader)
+	if rawJWT == "" {
+		return "", fmt.Errorf("failed to find Access application at %s", reqURL)
+	}
+	return rawJWT, nil
+}
+
+func validateMetadataIssuedAt(iat int64, now time.Time) error {
+	if iat <= 0 {
+		return errors.New("metadata JWT iat is missing or invalid")
+	}
+	issuedAt := time.Unix(iat, 0)
+	if issuedAt.Before(now.Add(-metadataMaxAge)) {
+		return fmt.Errorf("metadata JWT is older than %s", metadataMaxAge)
+	}
+	if issuedAt.After(now.Add(metadataAllowedClockSkew)) {
+		return fmt.Errorf("metadata JWT is more than %s in the future", metadataAllowedClockSkew)
+	}
+	return nil
+}
+
+func handleRedirects(req *http.Request, via []*http.Request, orgToken string) error {
+	// attach org token to login request
+	if strings.Contains(req.URL.Path, AccessLoginWorkerPath) {
+		req.AddCookie(&http.Cookie{Name: tokenCookie, Value: orgToken}) //nolint: gosec
+	}
+
+	// attach app session cookie to authorized request
+	if strings.Contains(req.URL.Path, AccessAuthorizedWorkerPath) {
+		// We need to check and see if the CF_APP_SESSION cookie was set
+		for _, prevReq := range via {
+			if prevReq != nil && prevReq.Response != nil {
+				for _, c := range prevReq.Response.Cookies() {
+					if c.Name == appSessionCookie {
+						req.AddCookie(&http.Cookie{Name: appSessionCookie, Value: c.Value}) //nolint: gosec
+						return nil
+					}
+				}
+			}
 		}
-	} else if audHeader := resp.Header.Get(appAUDHeader); audHeader != "" {
-		// 403/401 from the edge will have aud in a header
-		aud = audHeader
-	} else {
-		return nil, fmt.Errorf("failed to get Access app info for %s", reqURL.String())
 	}
 
-	domain := resp.Header.Get(appDomainHeader)
-	if domain == "" {
-		return nil, errors.New("Empty app domain")
+	// stop after hitting authorized endpoint since it will contain the app token
+	if len(via) > 0 && strings.Contains(via[len(via)-1].URL.Path, AccessAuthorizedWorkerPath) {
+		return http.ErrUseLastResponse
 	}
-
-	return &AppInfo{location.Hostname(), aud, domain}, nil
+	return nil
 }
 
 // exchangeOrgToken attaches an org token to a request to the appURL and returns an app token. This uses the Access SSO
@@ -294,15 +558,7 @@ func GetAppInfo(reqURL *url.URL) (*AppInfo, error) {
 func exchangeOrgToken(appURL *url.URL, orgToken string) (string, error) {
 	client := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// attach org token to login request
-			if strings.Contains(req.URL.Path, AccessLoginWorkerPath) {
-				req.AddCookie(&http.Cookie{Name: tokenCookie, Value: orgToken})
-			}
-			// stop after hitting authorized endpoint since it will contain the app token
-			if strings.Contains(via[len(via)-1].URL.Path, "cdn-cgi/access/authorized") {
-				return http.ErrUseLastResponse
-			}
-			return nil
+			return handleRedirects(req, via, orgToken)
 		},
 		Timeout: time.Second * 7,
 	}
@@ -311,11 +567,12 @@ func exchangeOrgToken(appURL *url.URL, orgToken string) (string, error) {
 	if err != nil {
 		return "", errors.Wrap(err, "failed to create app token request")
 	}
-	resp, err := client.Do(appTokenRequest)
+	appTokenRequest.Header.Add(userAgentHeader, userAgent)
+	resp, err := client.Do(appTokenRequest) // nolint: gosec
 	if err != nil {
 		return "", errors.Wrap(err, "failed to get app token")
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	var appToken string
 	for _, c := range resp.Cookies() {
 		//if Org token revoked on exchange, getTokensFromEdge instead
@@ -342,7 +599,7 @@ func GetOrgTokenIfExists(authDomain string) (string, error) {
 		return "", err
 	}
 	var payload jwtPayload
-	err = json.Unmarshal(token.Payload, &payload)
+	err = json.Unmarshal(token.UnsafePayloadWithoutVerification(), &payload)
 	if err != nil {
 		return "", err
 	}
@@ -351,11 +608,11 @@ func GetOrgTokenIfExists(authDomain string) (string, error) {
 		err := os.Remove(path)
 		return "", err
 	}
-	return token.Encode(), nil
+	return token.CompactSerialize()
 }
 
 func GetAppTokenIfExists(appInfo *AppInfo) (string, error) {
-	path, err := GenerateAppTokenFilePathFromURL(appInfo.AppDomain, appInfo.AppAUD, keyName)
+	path, err := GenerateAppTokenFilePathFromURL(appInfo.AppHostname, appInfo.AppAUD, keyName)
 	if err != nil {
 		return "", err
 	}
@@ -364,7 +621,7 @@ func GetAppTokenIfExists(appInfo *AppInfo) (string, error) {
 		return "", err
 	}
 	var payload jwtPayload
-	err = json.Unmarshal(token.Payload, &payload)
+	err = json.Unmarshal(token.UnsafePayloadWithoutVerification(), &payload)
 	if err != nil {
 		return "", err
 	}
@@ -373,27 +630,32 @@ func GetAppTokenIfExists(appInfo *AppInfo) (string, error) {
 		err := os.Remove(path)
 		return "", err
 	}
-	return token.Encode(), nil
+	if !slices.Contains(payload.Aud, appInfo.AppAUD) {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("failed to remove cached token with unexpected audience: %w", err)
+		}
+		return "", fmt.Errorf("cached token audience does not include expected application audience %q", appInfo.AppAUD)
+	}
 
+	return token.CompactSerialize()
 }
 
 // GetTokenIfExists will return the token from local storage if it exists and not expired
-func getTokenIfExists(path string) (*jose.JWT, error) {
-	content, err := ioutil.ReadFile(path)
+func getTokenIfExists(path string) (*jose.JSONWebSignature, error) {
+	content, err := os.ReadFile(path) // nolint: gosec
 	if err != nil {
 		return nil, err
 	}
-	token, err := jose.ParseJWT(string(content))
+	token, err := jose.ParseSigned(string(content), signatureAlgs)
 	if err != nil {
 		return nil, err
 	}
-
-	return &token, nil
+	return token, nil
 }
 
 // RemoveTokenIfExists removes the a token from local storage if it exists
 func RemoveTokenIfExists(appInfo *AppInfo) error {
-	path, err := GenerateAppTokenFilePathFromURL(appInfo.AppDomain, appInfo.AppAUD, keyName)
+	path, err := GenerateAppTokenFilePathFromURL(appInfo.AppHostname, appInfo.AppAUD, keyName)
 	if err != nil {
 		return err
 	}

@@ -11,7 +11,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/getsentry/raven-go"
+	"github.com/getsentry/sentry-go"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 	"github.com/urfave/cli/v2"
@@ -19,6 +19,7 @@ import (
 
 	"github.com/cloudflare/cloudflared/carrier"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
+	cfdflags "github.com/cloudflare/cloudflared/cmd/cloudflared/flags"
 	"github.com/cloudflare/cloudflared/logger"
 	"github.com/cloudflare/cloudflared/sshgen"
 	"github.com/cloudflare/cloudflared/token"
@@ -26,6 +27,8 @@ import (
 )
 
 const (
+	appURLFlag         = "app"
+	loginQuietFlag     = "quiet"
 	sshHostnameFlag    = "hostname"
 	sshDestinationFlag = "destination"
 	sshURLFlag         = "url"
@@ -34,33 +37,34 @@ const (
 	sshTokenSecretFlag = "service-token-secret"
 	sshGenCertFlag     = "short-lived-cert"
 	sshConnectTo       = "connect-to"
+	sshDebugStream     = "debug-stream"
 	sshConfigTemplate  = `
 Add to your {{.Home}}/.ssh/config:
 
-Host {{.Hostname}}
 {{- if .ShortLivedCerts}}
-  ProxyCommand bash -c '{{.Cloudflared}} access ssh-gen --hostname %h; ssh -tt %r@cfpipe-{{.Hostname}} >&2 <&1'
-
-Host cfpipe-{{.Hostname}}
-  HostName {{.Hostname}}
+Match host {{.Hostname}} exec "{{.Cloudflared}} access ssh-gen --hostname %h"
   ProxyCommand {{.Cloudflared}} access ssh --hostname %h
-  IdentityFile ~/.cloudflared/{{.Hostname}}-cf_key
-  CertificateFile ~/.cloudflared/{{.Hostname}}-cf_key-cert.pub
+  IdentityFile ~/.cloudflared/%h-cf_key
+  CertificateFile ~/.cloudflared/%h-cf_key-cert.pub
 {{- else}}
+Host {{.Hostname}}
   ProxyCommand {{.Cloudflared}} access ssh --hostname %h
 {{end}}
 `
+	fedrampFlag = "fedramp"
 )
 
 const sentryDSN = "https://56a9c9fa5c364ab28f34b14f35ea0f1b@sentry.io/189878"
 
 var (
 	shutdownC chan struct{}
+	userAgent = "DEV"
 )
 
 // Init will initialize and store vars from the main program
-func Init(shutdown chan struct{}) {
+func Init(shutdown chan struct{}, version string) {
 	shutdownC = shutdown
+	userAgent = fmt.Sprintf("cloudflared/%s", version)
 }
 
 // Flags return the global flags for Access related commands (hopefully none)
@@ -76,20 +80,43 @@ func Commands() []*cli.Command {
 			Aliases:  []string{"forward"},
 			Category: "Access",
 			Usage:    "access <subcommand>",
+			Flags: []cli.Flag{&cli.BoolFlag{
+				Name:  fedrampFlag,
+				Usage: "Force the FedRAMP token transfer relay for Access authentication. Not usually needed: cloudflared selects it automatically when the application's verified auth domain is a FedRAMP domain (*.fed.cloudflareaccess.com).",
+			}},
 			Description: `Cloudflare Access protects internal resources by securing, authenticating and monitoring access
 			per-user and by application. With Cloudflare Access, only authenticated users with the required permissions are
 			able to reach sensitive resources. The commands provided here allow you to interact with Access protected
 			applications from the command line.`,
 			Subcommands: []*cli.Command{
 				{
-					Name:   "login",
-					Action: cliutil.Action(login),
-					Usage:  "login <url of access application>",
+					Name:      "login",
+					Action:    cliutil.Action(login),
+					Usage:     "login <url of access application>",
+					ArgsUsage: "url of Access application",
 					Description: `The login subcommand initiates an authentication flow with your identity provider.
 					The subcommand will launch a browser. For headless systems, a url is provided.
 					Once authenticated with your identity provider, the login command will generate a JSON Web Token (JWT)
 					scoped to your identity, the application you intend to reach, and valid for a session duration set by your
 					administrator. cloudflared stores the token in local storage.`,
+					Flags: []cli.Flag{
+						&cli.BoolFlag{
+							Name:    loginQuietFlag,
+							Aliases: []string{"q"},
+							Usage:   "do not print the jwt to the command line",
+						},
+						&cli.BoolFlag{
+							Name:  "no-verbose",
+							Usage: "print only the jwt to stdout",
+						},
+						&cli.BoolFlag{
+							Name:  "auto-close",
+							Usage: "automatically close the auth interstitial after action",
+						},
+						&cli.StringFlag{
+							Name: appURLFlag,
+						},
+					},
 				},
 				{
 					Name:   "curl",
@@ -103,12 +130,12 @@ func Commands() []*cli.Command {
 				{
 					Name:        "token",
 					Action:      cliutil.Action(generateToken),
-					Usage:       "token -app=<url of access application>",
+					Usage:       "token <url of access application>",
 					ArgsUsage:   "url of Access application",
 					Description: `The token subcommand produces a JWT which can be used to authenticate requests.`,
 					Flags: []cli.Flag{
 						&cli.StringFlag{
-							Name: "app",
+							Name: appURLFlag,
 						},
 					},
 				},
@@ -124,15 +151,18 @@ func Commands() []*cli.Command {
 							Name:    sshHostnameFlag,
 							Aliases: []string{"tunnel-host", "T"},
 							Usage:   "specify the hostname of your application.",
+							EnvVars: []string{"TUNNEL_SERVICE_HOSTNAME"},
 						},
 						&cli.StringFlag{
-							Name:  sshDestinationFlag,
-							Usage: "specify the destination address of your SSH server.",
+							Name:    sshDestinationFlag,
+							Usage:   "specify the destination address of your SSH server.",
+							EnvVars: []string{"TUNNEL_SERVICE_DESTINATION"},
 						},
 						&cli.StringFlag{
 							Name:    sshURLFlag,
 							Aliases: []string{"listener", "L"},
 							Usage:   "specify the host:port to forward data to Cloudflare edge.",
+							EnvVars: []string{"TUNNEL_SERVICE_URL"},
 						},
 						&cli.StringSliceFlag{
 							Name:    sshHeaderFlag,
@@ -143,19 +173,24 @@ func Commands() []*cli.Command {
 							Name:    sshTokenIDFlag,
 							Aliases: []string{"id"},
 							Usage:   "specify an Access service token ID you wish to use.",
+							EnvVars: []string{"TUNNEL_SERVICE_TOKEN_ID"},
 						},
 						&cli.StringFlag{
 							Name:    sshTokenSecretFlag,
 							Aliases: []string{"secret"},
 							Usage:   "specify an Access service token secret you wish to use.",
+							EnvVars: []string{"TUNNEL_SERVICE_TOKEN_SECRET"},
 						},
 						&cli.StringFlag{
-							Name:    logger.LogSSHDirectoryFlag,
-							Aliases: []string{"logfile"}, //added to match the tunnel side
-							Usage:   "Save application log to this directory for reporting issues.",
+							Name:  cfdflags.LogFile,
+							Usage: "Save application log to this file for reporting issues.",
 						},
 						&cli.StringFlag{
-							Name:    logger.LogSSHLevelFlag,
+							Name:  cfdflags.LogDirectory,
+							Usage: "Save application log to this directory for reporting issues.",
+						},
+						&cli.StringFlag{
+							Name:    cfdflags.LogLevelSSH,
 							Aliases: []string{"loglevel"}, //added to match the tunnel side
 							Usage:   "Application logging level {debug, info, warn, error, fatal}. ",
 						},
@@ -163,6 +198,11 @@ func Commands() []*cli.Command {
 							Name:   sshConnectTo,
 							Hidden: true,
 							Usage:  "Connect to alternate location for testing, value is host, host:port, or sni:port:host",
+						},
+						&cli.Uint64Flag{
+							Name:   sshDebugStream,
+							Hidden: true,
+							Usage:  "Writes up-to the max provided stream payloads to the logger as debug statements.",
 						},
 					},
 				},
@@ -201,16 +241,18 @@ func Commands() []*cli.Command {
 
 // login pops up the browser window to do the actual login and JWT generation
 func login(c *cli.Context) error {
-	if err := raven.SetDSN(sentryDSN); err != nil {
+	err := sentry.Init(sentry.ClientOptions{
+		Dsn:     sentryDSN,
+		Release: c.App.Version,
+	})
+	if err != nil {
 		return err
 	}
 
 	log := logger.CreateLoggerFromContext(c, logger.EnableTerminalLog)
 
-	args := c.Args()
-	rawURL := ensureURLScheme(args.First())
-	appURL, err := url.Parse(rawURL)
-	if args.Len() < 1 || err != nil {
+	appURL, err := getAppURLFromArgs(c)
+	if err != nil {
 		log.Error().Msg("Please provide the url of the Access application")
 		return err
 	}
@@ -233,24 +275,33 @@ func login(c *cli.Context) error {
 		fmt.Fprintln(os.Stderr, "token for provided application was empty.")
 		return errors.New("empty application token")
 	}
-	fmt.Fprintf(os.Stdout, "Successfully fetched your token:\n\n%s\n\n", cfdToken)
+
+	if c.Bool(loginQuietFlag) {
+		return nil
+	}
+
+	// Chatty by default for backward compat. The new --app flag
+	// is an implicit opt-out of the backwards-compatible chatty output.
+	if c.Bool("no-verbose") || c.IsSet(appURLFlag) {
+		if _, err := fmt.Fprint(os.Stdout, cfdToken); err != nil {
+			return fmt.Errorf("failed to write token to stdout: %w", err)
+		}
+	} else {
+		if _, err := fmt.Fprintf(os.Stdout, "Successfully fetched your token:\n\n%s\n\n", cfdToken); err != nil {
+			return fmt.Errorf("failed to write token to stdout: %w", err)
+		}
+	}
 
 	return nil
 }
 
-// ensureURLScheme prepends a URL with https:// if it doesnt have a scheme. http:// URLs will not be converted.
-func ensureURLScheme(url string) string {
-	url = strings.Replace(strings.ToLower(url), "http://", "https://", 1)
-	if !strings.HasPrefix(url, "https://") {
-		url = fmt.Sprintf("https://%s", url)
-
-	}
-	return url
-}
-
 // curl provides a wrapper around curl, passing Access JWT along in request
 func curl(c *cli.Context) error {
-	if err := raven.SetDSN(sentryDSN); err != nil {
+	err := sentry.Init(sentry.ClientOptions{
+		Dsn:     sentryDSN,
+		Release: c.App.Version,
+	})
+	if err != nil {
 		return err
 	}
 	log := logger.CreateLoggerFromContext(c, logger.EnableTerminalLog)
@@ -271,13 +322,20 @@ func curl(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+
+	// Verify that the existing token is still good; if not fetch a new one
+	if err := verifyTokenAtEdge(appURL, appInfo, c, log); err != nil {
+		log.Err(err).Msg("Could not verify token")
+		return err
+	}
+
 	tok, err := token.GetAppTokenIfExists(appInfo)
 	if err != nil || tok == "" {
 		if allowRequest {
 			log.Info().Msg("You don't have an Access token set. Please run access token <access application> to fetch one.")
 			return run("curl", cmdArgs...)
 		}
-		tok, err = token.FetchToken(appURL, appInfo, log)
+		tok, err = token.FetchToken(appURL, appInfo, c.Bool(cfdflags.AutoCloseInterstitial), c.Bool(fedrampFlag), log)
 		if err != nil {
 			log.Err(err).Msg("Failed to refresh token")
 			return err
@@ -291,13 +349,14 @@ func curl(c *cli.Context) error {
 
 // run kicks off a shell task and pipe the results to the respective std pipes
 func run(cmd string, args ...string) error {
-	c := exec.Command(cmd, args...)
+	c := exec.Command(cmd, args...) // nolint: gosec // access curl intentionally runs curl with user-supplied arguments
+	c.Stdin = os.Stdin
 	stderr, err := c.StderrPipe()
 	if err != nil {
 		return err
 	}
 	go func() {
-		io.Copy(os.Stderr, stderr)
+		_, _ = io.Copy(os.Stderr, stderr)
 	}()
 
 	stdout, err := c.StdoutPipe()
@@ -305,18 +364,33 @@ func run(cmd string, args ...string) error {
 		return err
 	}
 	go func() {
-		io.Copy(os.Stdout, stdout)
+		_, _ = io.Copy(os.Stdout, stdout)
 	}()
 	return c.Run()
 }
 
+func getAppURLFromArgs(c *cli.Context) (*url.URL, error) {
+	var appURLStr string
+	args := c.Args()
+	if args.Len() < 1 {
+		appURLStr = c.String(appURLFlag)
+	} else {
+		appURLStr = args.First()
+	}
+	return parseURL(appURLStr)
+}
+
 // token dumps provided token to stdout
 func generateToken(c *cli.Context) error {
-	if err := raven.SetDSN(sentryDSN); err != nil {
+	err := sentry.Init(sentry.ClientOptions{
+		Dsn:     sentryDSN,
+		Release: c.App.Version,
+	})
+	if err != nil {
 		return err
 	}
-	appURL, err := url.Parse(ensureURLScheme(c.String("app")))
-	if err != nil || c.NumFlags() < 1 {
+	appURL, err := getAppURLFromArgs(c)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "Please provide a url.")
 		return err
 	}
@@ -368,7 +442,7 @@ func sshGen(c *cli.Context) error {
 		return cli.ShowCommandHelp(c, "ssh-gen")
 	}
 
-	originURL, err := url.Parse(ensureURLScheme(hostname))
+	originURL, err := parseURL(hostname)
 	if err != nil {
 		return err
 	}
@@ -381,7 +455,7 @@ func sshGen(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	cfdToken, err := token.FetchTokenWithRedirect(fetchTokenURL, appInfo, log)
+	cfdToken, err := token.FetchTokenWithRedirect(fetchTokenURL, appInfo, c.Bool(cfdflags.AutoCloseInterstitial), c.Bool(fedrampFlag), log)
 	if err != nil {
 		return err
 	}
@@ -447,6 +521,11 @@ func processURL(s string) (*url.URL, error) {
 
 // cloudflaredPath pulls the full path of cloudflared on disk
 func cloudflaredPath() string {
+	path, err := os.Executable()
+	if err == nil && isFileThere(path) {
+		return path
+	}
+
 	for _, p := range strings.Split(os.Getenv("PATH"), ":") {
 		path := fmt.Sprintf("%s/%s", p, "cloudflared")
 		if isFileThere(path) {
@@ -458,7 +537,7 @@ func cloudflaredPath() string {
 
 // isFileThere will check for the presence of candidate path
 func isFileThere(candidate string) bool {
-	fi, err := os.Stat(candidate)
+	fi, err := os.Stat(candidate) // nolint: gosec // read-only stat of the cloudflared executable or PATH candidates
 	if err != nil || fi.IsDir() || !fi.Mode().IsRegular() {
 		return false
 	}
@@ -466,17 +545,17 @@ func isFileThere(candidate string) bool {
 }
 
 // verifyTokenAtEdge checks for a token on disk, or generates a new one.
-// Then makes a request to to the origin with the token to ensure it is valid.
+// Then makes a request to the origin with the token to ensure it is valid.
 // Returns nil if token is valid.
 func verifyTokenAtEdge(appUrl *url.URL, appInfo *token.AppInfo, c *cli.Context, log *zerolog.Logger) error {
-	headers := buildRequestHeaders(c.StringSlice(sshHeaderFlag))
+	headers := parseRequestHeaders(c.StringSlice(sshHeaderFlag))
 	if c.IsSet(sshTokenIDFlag) {
 		headers.Add(cfAccessClientIDHeader, c.String(sshTokenIDFlag))
 	}
 	if c.IsSet(sshTokenSecretFlag) {
 		headers.Add(cfAccessClientSecretHeader, c.String(sshTokenSecretFlag))
 	}
-	options := &carrier.StartOptions{AppInfo: appInfo, OriginURL: appUrl.String(), Headers: headers}
+	options := &carrier.StartOptions{AppInfo: appInfo, OriginURL: appUrl.String(), Headers: headers, AutoCloseInterstitial: c.Bool(cfdflags.AutoCloseInterstitial), IsFedramp: c.Bool(fedrampFlag)}
 
 	if valid, err := isTokenValid(options, log); err != nil {
 		return err
@@ -503,6 +582,11 @@ func isTokenValid(options *carrier.StartOptions, log *zerolog.Logger) (bool, err
 	if err != nil {
 		return false, errors.Wrap(err, "Could not create access request")
 	}
+	req.Header.Set("User-Agent", userAgent)
+
+	query := req.URL.Query()
+	query.Set("cloudflared_token_check", "true")
+	req.URL.RawQuery = query.Encode()
 
 	// Do not follow redirects
 	client := &http.Client{
@@ -515,7 +599,7 @@ func isTokenValid(options *carrier.StartOptions, log *zerolog.Logger) (bool, err
 	if err != nil {
 		return false, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// A redirect to login means the token was invalid.
 	return !carrier.IsAccessResponse(resp), nil

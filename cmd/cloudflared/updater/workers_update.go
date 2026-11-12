@@ -3,7 +3,6 @@ package updater
 import (
 	"archive/tar"
 	"compress/gzip"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -11,11 +10,15 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"text/template"
 	"time"
+
+	"github.com/getsentry/sentry-go"
+
+	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
 )
 
 const (
@@ -25,14 +28,13 @@ const (
 	// rename cloudflared.exe.new to cloudflared.exe
 	// delete cloudflared.exe.old
 	// start the service
-	// delete the batch file
-	windowsUpdateCommandTemplate = `@echo off
-sc stop cloudflared >nul 2>&1
+	// exit with code 0 if we've reached this point indicating success.
+	windowsUpdateCommandTemplate = `sc stop cloudflared >nul 2>&1
+del "{{.OldPath}}"
 rename "{{.TargetPath}}" {{.OldName}}
 rename "{{.NewPath}}" {{.BinaryName}}
-del "{{.OldPath}}"
 sc start cloudflared >nul 2>&1
-del {{.BatchName}}`
+exit /b 0`
 	batchFileName = "cfd_update.bat"
 )
 
@@ -47,7 +49,7 @@ type batchData struct {
 }
 
 // WorkersVersion implements the Version interface.
-// It contains everything needed to preform a version upgrade
+// It contains everything needed to perform a version upgrade
 type WorkersVersion struct {
 	downloadURL  string
 	checksum     string
@@ -87,8 +89,25 @@ func (v *WorkersVersion) Apply() error {
 		return err
 	}
 
-	// check that the file is what is expected
-	if err := isValidChecksum(v.checksum, newFilePath); err != nil {
+	downloadSum, err := cliutil.FileChecksum(newFilePath)
+	if err != nil {
+		return err
+	}
+
+	// Check that the file downloaded matches what is expected.
+	if v.checksum != downloadSum {
+		return errors.New("checksum validation failed")
+	}
+
+	// Check if the currently running version has the same checksum
+	if downloadSum == buildInfo.Checksum {
+		// Currently running binary matches the downloaded binary so we have no reason to update. This is
+		// typically unexpected, as such we emit a sentry event.
+		localHub := sentry.CurrentHub().Clone()
+		err := errors.New("checksum validation matches currently running process")
+		localHub.CaptureException(err)
+		// Make sure to cleanup the new downloaded file since we aren't upgrading versions.
+		os.Remove(newFilePath)
 		return err
 	}
 
@@ -115,7 +134,7 @@ func (v *WorkersVersion) Apply() error {
 
 	if err := os.Rename(newFilePath, v.targetPath); err != nil {
 		//attempt rollback
-		os.Rename(oldFilePath, v.targetPath)
+		_ = os.Rename(oldFilePath, v.targetPath)
 		return err
 	}
 	os.Remove(oldFilePath)
@@ -162,7 +181,7 @@ func download(url, filepath string, isCompressed bool) error {
 		tr := tar.NewReader(gr)
 
 		// advance the reader pass the header, which will be the single binary file
-		tr.Next()
+		_, _ = tr.Next()
 
 		r = tr
 	}
@@ -179,7 +198,7 @@ func download(url, filepath string, isCompressed bool) error {
 
 // isCompressedFile is a really simple file extension check to see if this is a macos tar and gzipped
 func isCompressedFile(urlstring string) bool {
-	if strings.HasSuffix(urlstring, ".tgz") {
+	if path.Ext(urlstring) == ".tgz" {
 		return true
 	}
 
@@ -187,35 +206,15 @@ func isCompressedFile(urlstring string) bool {
 	if err != nil {
 		return false
 	}
-	return strings.HasSuffix(u.Path, ".tgz")
-}
-
-// checks if the checksum in the json response matches the checksum of the file download
-func isValidChecksum(checksum, filePath string) error {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return err
-	}
-
-	hash := fmt.Sprintf("%x", h.Sum(nil))
-
-	if checksum != hash {
-		return errors.New("checksum validation failed")
-	}
-	return nil
+	return path.Ext(u.Path) == ".tgz"
 }
 
 // writeBatchFile writes a batch file out to disk
 // see the dicussion on why it has to be done this way
 func writeBatchFile(targetPath string, newPath string, oldPath string) error {
-	os.Remove(batchFileName) //remove any failed updates before download
-	f, err := os.Create(batchFileName)
+	batchFilePath := filepath.Join(filepath.Dir(targetPath), batchFileName)
+	os.Remove(batchFilePath) //remove any failed updates before download
+	f, err := os.Create(batchFilePath)
 	if err != nil {
 		return err
 	}
@@ -241,6 +240,15 @@ func writeBatchFile(targetPath string, newPath string, oldPath string) error {
 
 // run each OS command for windows
 func runWindowsBatch(batchFile string) error {
-	cmd := exec.Command("cmd", "/c", batchFile)
-	return cmd.Start()
+	defer os.Remove(batchFile)
+	cmd := exec.Command("cmd", "/C", batchFile)
+	_, err := cmd.Output()
+	// Remove the batch file we created. Don't let this interfere with the error
+	// we report.
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			return fmt.Errorf("Error during update : %s;", string(exitError.Stderr))
+		}
+	}
+	return err
 }

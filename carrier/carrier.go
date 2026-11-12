@@ -1,6 +1,6 @@
-//Package carrier provides a WebSocket proxy to carry or proxy a connection
-//from the local client to the edge. See it as a wrapper around any protocol
-//that it packages up in a WebSocket connection to the edge.
+// Package carrier provides a WebSocket proxy to carry or proxy a connection
+// from the local client to the edge. See it as a wrapper around any protocol
+// that it packages up in a WebSocket connection to the edge.
 package carrier
 
 import (
@@ -26,11 +26,13 @@ const (
 )
 
 type StartOptions struct {
-	AppInfo         *token.AppInfo
-	OriginURL       string
-	Headers         http.Header
-	Host            string
-	TLSClientConfig *tls.Config
+	AppInfo               *token.AppInfo
+	OriginURL             string
+	Headers               http.Header
+	Host                  string
+	TLSClientConfig       *tls.Config
+	AutoCloseInterstitial bool
+	IsFedramp             bool
 }
 
 // Connection wraps up all the needed functions to forward over the tunnel
@@ -46,7 +48,6 @@ type StdinoutStream struct{}
 // Read will read from Stdin
 func (c *StdinoutStream) Read(p []byte) (int, error) {
 	return os.Stdin.Read(p)
-
 }
 
 // Write will write to Stdout
@@ -54,7 +55,7 @@ func (c *StdinoutStream) Write(p []byte) (int, error) {
 	return os.Stdout.Write(p)
 }
 
-// Helper to allow defering the response close with a check that the resp is not nil
+// Helper to allow deferring the response close with a check that the resp is not nil
 func closeRespBody(resp *http.Response) {
 	if resp != nil {
 		_ = resp.Body.Close()
@@ -139,7 +140,7 @@ func BuildAccessRequest(options *StartOptions, log *zerolog.Logger) (*http.Reque
 		return nil, err
 	}
 
-	token, err := token.FetchTokenWithRedirect(req.URL, options.AppInfo, log)
+	token, err := token.FetchTokenWithRedirect(req.URL, options.AppInfo, options.AutoCloseInterstitial, options.IsFedramp, log)
 	if err != nil {
 		return nil, err
 	}
